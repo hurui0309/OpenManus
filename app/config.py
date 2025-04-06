@@ -29,6 +29,23 @@ class LLMSettings(BaseModel):
     api_version: str = Field(..., description="Azure Openai version if AzureOpenai")
 
 
+class DatabaseSettings(BaseModel):
+    """数据库配置类"""
+    driver: str = Field("postgresql", description="Database driver (postgresql, mysql, sqlite)")
+    host: str = Field("localhost", description="Database host")
+    port: int = Field(3306, description="Database port")
+    username: str = Field("root", description="Database username")
+    password: str = Field("123456", description="Database password")
+    database: str = Field("test", description="Database name")
+
+    @property
+    def connection_url(self) -> str:
+        """获取数据库连接URL"""
+        if self.driver == "sqlite":
+            return f"sqlite:///{self.database}"
+        return f"{self.driver}://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+
 class ProxySettings(BaseModel):
     server: str = Field(None, description="Proxy server address")
     username: Optional[str] = Field(None, description="Proxy username")
@@ -108,6 +125,10 @@ class MCPSettings(BaseModel):
 
 class AppConfig(BaseModel):
     llm: Dict[str, LLMSettings]
+    database: DatabaseSettings = Field(
+        default_factory=lambda: DatabaseSettings(),
+        description="Database configuration"
+    )
     sandbox: Optional[SandboxSettings] = Field(
         None, description="Sandbox configuration"
     )
@@ -177,6 +198,17 @@ class Config:
             "api_version": base_llm.get("api_version", ""),
         }
 
+        # 创建LLM配置
+        llm_config = {"default": LLMSettings(**default_settings)}
+        for name, override in llm_overrides.items():
+            settings = default_settings.copy()
+            settings.update(override)
+            llm_config[name] = LLMSettings(**settings)
+
+        # 加载数据库配置
+        db_config = raw_config.get("database", {})
+        database_settings = DatabaseSettings(**db_config)
+
         # handle browser config.
         browser_config = raw_config.get("browser", {})
         browser_settings = None
@@ -227,25 +259,24 @@ class Config:
         else:
             mcp_settings = MCPSettings()
 
-        config_dict = {
-            "llm": {
-                "default": default_settings,
-                **{
-                    name: {**default_settings, **override_config}
-                    for name, override_config in llm_overrides.items()
-                },
-            },
-            "sandbox": sandbox_settings,
-            "browser_config": browser_settings,
-            "search_config": search_settings,
-            "mcp_config": mcp_settings,
-        }
-
-        self._config = AppConfig(**config_dict)
+        self._config = AppConfig(
+            llm=llm_config,
+            database=database_settings,
+            sandbox=sandbox_settings,
+            browser_config=browser_settings,
+            search_config=search_settings,
+            mcp_config=mcp_settings
+        )
 
     @property
     def llm(self) -> Dict[str, LLMSettings]:
+        """获取LLM配置"""
         return self._config.llm
+
+    @property
+    def database(self) -> DatabaseSettings:
+        """获取数据库配置"""
+        return self._config.database
 
     @property
     def sandbox(self) -> SandboxSettings:

@@ -1,3 +1,13 @@
+"""Custom exceptions for the application."""
+
+class DatabaseError(Exception):
+    """Raised when a database operation fails."""
+    pass
+
+class ReviewError(Exception):
+    """Raised when SQL review operation fails."""
+    pass
+
 class ToolError(Exception):
     """Raised when a tool encounters an error."""
 
