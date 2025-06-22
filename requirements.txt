@@ -7,9 +7,15 @@ numpy
 datasets~=3.4.1
 fastapi~=0.115.11
 tiktoken~=0.9.0
-sqlalchemy~=2.0.28
+sqlalchemy>=1.4.0,<2.0.0
 pymysql~=1.1.1
 cryptography~=44.0.2
+
+# Hive连接相关依赖 (compatible with Hive 2.3.3 and SQLAlchemy 1.4.x)
+pyhive[hive]==0.6.5
+thrift==0.16.0
+pure-sasl==0.6.2
+thrift-sasl==0.4.3
 
 html2text~=2024.2.26
 gymnasium~=1.1.1
