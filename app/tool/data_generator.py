@@ -99,12 +99,13 @@ class DataGeneratorTool(BaseTool):
     def _ensure_log_table(self) -> None:
         """确保数据生成日志表存在。"""
         try:
-            with self.engine.connect() as conn:
-                # 检查表是否存在
-                inspector = inspect(self.engine)
-                tables = inspector.get_table_names()
+            # 检查表是否存在
+            inspector = inspect(self.engine)
+            tables = inspector.get_table_names()
 
-                if "data_generation_logs" not in tables:
+            if "data_generation_logs" not in tables:
+                # 使用事务创建日志表
+                with self.engine.begin() as conn:
                     # 创建日志表
                     create_table_sql = """
                     CREATE TABLE data_generation_logs (
@@ -118,11 +119,13 @@ class DataGeneratorTool(BaseTool):
                     )
                     """
                     conn.execute(text(create_table_sql))
-                    conn.commit()
-                    logger.info("数据生成日志表创建成功")
+                    # begin() 上下文管理器会自动提交
+                logger.info("数据生成日志表创建成功")
 
         except SQLAlchemyError as e:
             logger.error(f"创建日志表失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"创建日志表时出现意外错误: {str(e)}")
 
     def _log_generation(
         self,
@@ -134,7 +137,8 @@ class DataGeneratorTool(BaseTool):
     ) -> None:
         """记录数据生成操作。"""
         try:
-            with self.engine.connect() as conn:
+            # 使用事务明确管理提交
+            with self.engine.begin() as conn:
                 conn.execute(
                     text(
                         """
@@ -151,9 +155,11 @@ class DataGeneratorTool(BaseTool):
                         "error_message": error_message,
                     },
                 )
-                conn.commit()
+                # begin() 上下文管理器会自动提交
         except SQLAlchemyError as e:
             logger.error(f"记录数据生成日志失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"记录数据生成日志时出现意外错误: {str(e)}")
 
     async def get_table_schema(
         self, table_name: str, ds_name: Optional[str] = None
@@ -223,35 +229,49 @@ class DataGeneratorTool(BaseTool):
                 in_partition_section = False
 
                 for row in result:
-                    col_name = row[0] if isinstance(row, tuple) else str(row).split()[0]
-                    col_type = (
-                        row[1] if isinstance(row, tuple) and len(row) > 1 else "string"
+                    # 清理列名和类型，去除多余的括号和引号
+                    raw_col_name = str(row[0]) if len(row) > 0 else ""
+                    raw_col_type = str(row[1]) if len(row) > 1 else "string"
+
+                    # 清理列名
+                    col_name = raw_col_name.strip("('\")")
+                    col_type = raw_col_type.strip("('\")")
+
+                    logger.debug(
+                        f"解析列: 原始='{raw_col_name}' 清理后='{col_name}' 类型='{col_type}'"
                     )
 
                     # 检查是否到达分区信息部分
                     if (
-                        "# Partition Information" in str(row)
-                        or "partition_columns" in str(row).lower()
+                        "# Partition Information" in raw_col_name
+                        or "partition_columns" in raw_col_name.lower()
+                        or "col_name" in raw_col_name.lower()
                     ):
                         in_partition_section = True
                         continue
 
+                    # 跳过空行、注释行和标题行
                     if (
-                        col_name
-                        and not col_name.startswith("#")
-                        and col_name != "col_name"
+                        not col_name
+                        or col_name.startswith("#")
+                        or col_name in ["col_name", ""]
+                        or not col_name.strip()
                     ):
-                        col_info = {
-                            "name": col_name,
-                            "type": col_type,
-                            "nullable": True,
-                            "default": None,
-                        }
+                        continue
 
-                        if in_partition_section:
-                            partition_columns.append(col_info)
-                        else:
-                            columns.append(col_info)
+                    col_info = {
+                        "name": col_name,
+                        "type": col_type,
+                        "nullable": True,
+                        "default": None,
+                    }
+
+                    if in_partition_section:
+                        partition_columns.append(col_info)
+                        logger.debug(f"添加分区列: {col_name}")
+                    else:
+                        columns.append(col_info)
+                        logger.debug(f"添加数据列: {col_name}")
 
             # 获取分区信息
             is_partitioned = len(partition_columns) > 0
@@ -346,6 +366,93 @@ class DataGeneratorTool(BaseTool):
 
         return final_sql
 
+    def _clean_sql_for_hive_execution(self, sql: str) -> str:
+        """清理SQL语句以适配Hive执行。
+
+        Args:
+            sql: 原始SQL语句
+
+        Returns:
+            str: 清理后的SQL语句
+        """
+        import re
+
+        # 基本清理
+        cleaned_sql = sql.strip()
+
+        # 移除SQL注释（-- 和 /* */ 样式）
+        cleaned_sql = re.sub(r"--.*?(?:\n|$)", " ", cleaned_sql)
+        cleaned_sql = re.sub(r"/\*.*?\*/", " ", cleaned_sql, flags=re.DOTALL)
+
+        # 移除多余的空白字符
+        cleaned_sql = re.sub(r"\s+", " ", cleaned_sql).strip()
+
+        logger.debug(f"SQL清理: 原始长度={len(sql)} 清理后长度={len(cleaned_sql)}")
+
+        return cleaned_sql
+
+    def _split_sql_statements(self, sql: str) -> List[str]:
+        """智能分割SQL语句。
+
+        Args:
+            sql: 包含多个SQL语句的字符串
+
+        Returns:
+            List[str]: 分割后的SQL语句列表
+        """
+        import re
+
+        # 先清理注释
+        cleaned_sql = self._clean_sql_for_hive_execution(sql)
+
+        # 使用正则表达式分割SQL语句，更准确地处理分号
+        # 这个正则表达式匹配不在引号内的分号
+        statements = []
+        current_pos = 0
+        in_single_quote = False
+        in_double_quote = False
+        paren_count = 0
+
+        i = 0
+        while i < len(cleaned_sql):
+            char = cleaned_sql[i]
+
+            # 处理引号
+            if char == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+            elif char == '"' and not in_single_quote:
+                in_double_quote = not in_double_quote
+            # 处理括号
+            elif not in_single_quote and not in_double_quote:
+                if char == "(":
+                    paren_count += 1
+                elif char == ")":
+                    paren_count -= 1
+                # 处理分号
+                elif char == ";" and paren_count == 0:
+                    # 找到语句边界
+                    stmt = cleaned_sql[current_pos:i].strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current_pos = i + 1
+
+            i += 1
+
+        # 处理最后一个语句
+        if current_pos < len(cleaned_sql):
+            stmt = cleaned_sql[current_pos:].strip()
+            if stmt and not stmt.endswith(";"):
+                statements.append(stmt)
+
+        # 过滤空语句
+        statements = [stmt for stmt in statements if stmt.strip()]
+
+        logger.debug(f"SQL分割结果: 找到 {len(statements)} 条语句")
+        for i, stmt in enumerate(statements, 1):
+            logger.debug(f"语句 {i}: {stmt[:50]}...")
+
+        return statements
+
     async def execute_data_generation(
         self, sql: str, ds_name: Optional[str] = None
     ) -> None:
@@ -365,55 +472,44 @@ class DataGeneratorTool(BaseTool):
             target_engine = await self._get_target_engine(ds_name)
             ds_type = await self._get_datasource_type(ds_name)
 
-            # 使用 begin() 来管理事务
-            with target_engine.begin() as conn:
-                # 分割多个SQL语句，保持语句的完整性
-                statements = []
-                current_stmt = []
+            # 智能分割SQL语句
+            statements = self._split_sql_statements(sql)
 
-                for line in sql.split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
+            if not statements:
+                raise DatabaseError("No valid SQL statements found")
 
-                    current_stmt.append(line)
-                    if line.endswith(";"):
-                        statements.append(" ".join(current_stmt))
-                        current_stmt = []
+            logger.info(f"找到 {len(statements)} 条SQL语句待执行")
 
-                # 处理最后一个语句
-                if current_stmt:
-                    stmt = " ".join(current_stmt)
-                    if not stmt.endswith(";"):
-                        stmt += ";"
-                    statements.append(stmt)
+            # 使用连接而不是事务，因为Hive可能不支持事务
+            with target_engine.connect() as conn:
+                # 对于Hive，先设置必要的参数
+                if ds_type == "hive":
+                    # 设置动态分区参数
+                    conn.execute(text("SET hive.exec.dynamic.partition = true"))
+                    conn.execute(
+                        text("SET hive.exec.dynamic.partition.mode = nonstrict")
+                    )
 
                 # 执行每条SQL语句
-                for stmt in statements:
+                for i, stmt in enumerate(statements, 1):
                     try:
-                        # 对于Hive，可能需要特殊处理
+                        # 清理单个语句
                         if ds_type == "hive":
-                            # Hive可能需要设置一些参数
-                            if "INSERT" in stmt.upper():
-                                # 设置动态分区参数
-                                conn.execute(
-                                    text("SET hive.exec.dynamic.partition = true")
-                                )
-                                conn.execute(
-                                    text(
-                                        "SET hive.exec.dynamic.partition.mode = nonstrict"
-                                    )
-                                )
+                            stmt = self._clean_sql_for_hive_execution(stmt)
+
+                        logger.info(f"执行第 {i}/{len(statements)} 条SQL语句")
+                        logger.debug(f"SQL: {stmt[:200]}...")
 
                         conn.execute(text(stmt))
+
                     except SQLAlchemyError as e:
-                        logger.error(f"Failed to execute SQL: {stmt}")
+                        logger.error(
+                            f"Failed to execute SQL statement {i}: {stmt[:100]}..."
+                        )
                         logger.error(f"Error: {str(e)}")
                         raise DatabaseError(
-                            f"Failed to execute SQL: {str(e)}\nSQL: {stmt}"
+                            f"Failed to execute SQL statement {i}: {str(e)}\nSQL: {stmt[:200]}..."
                         )
-
-                # 事务会在 with 块结束时自动提交
 
         except SQLAlchemyError as e:
             logger.error(f"Database operation failed: {str(e)}")
@@ -465,15 +561,30 @@ class DataGeneratorTool(BaseTool):
             schema_info_parts = []
             for schema in table_schemas:
                 table_info = f"表 {schema['table_name']}:\n"
-                table_info += f"列: {[col['name'] + '(' + str(col['type']) + ')' for col in schema['columns']]}\n"
-                table_info += f"主键: {schema['primary_keys']}\n"
 
-                # 如果是Hive分区表，添加分区信息
+                # 区分分区列和非分区列
                 if schema.get("is_partitioned", False):
-                    table_info += f"分区表 - 分区列: {schema['partition_columns']}\n"
-                    if schema.get("existing_partitions"):
-                        table_info += f"现有分区示例: {schema['existing_partitions'][:3]}\n"  # 只显示前3个分区
+                    # 获取非分区列
+                    non_partition_columns = [
+                        col
+                        for col in schema["columns"]
+                        if col["name"] not in schema.get("partition_columns", [])
+                    ]
 
+                    table_info += f"数据列: {[col['name'] + '(' + str(col['type']) + ')' for col in non_partition_columns]}\n"
+                    table_info += (
+                        f"**重要**: 这是分区表，分区列: {schema['partition_columns']}\n"
+                    )
+                    table_info += f"**注意**: INSERT语句只需要包含数据列，分区列在PARTITION子句中指定\n"
+
+                    if schema.get("existing_partitions"):
+                        table_info += (
+                            f"现有分区示例: {schema['existing_partitions'][:3]}\n"
+                        )
+                else:
+                    table_info += f"列: {[col['name'] + '(' + str(col['type']) + ')' for col in schema['columns']]}\n"
+
+                table_info += f"主键: {schema['primary_keys']}\n"
                 schema_info_parts.append(table_info)
 
             schema_info = "\n".join(schema_info_parts)
@@ -489,11 +600,14 @@ class DataGeneratorTool(BaseTool):
             elif ds_type == "hive":
                 specific_instructions = """
                 **Hive数据库要求：**
-                1. 如果表是分区表，INSERT语句必须包含PARTITION子句
-                2. 分区表的INSERT语法：INSERT INTO TABLE table_name PARTITION(partition_col='value') VALUES (...)
-                3. 或者使用动态分区：INSERT INTO TABLE table_name PARTITION(partition_col) VALUES (..., partition_value)
+                1. **分区表INSERT语法**：INSERT INTO TABLE table_name PARTITION(partition_col='value') VALUES (data_columns_only)
+                2. **重要**：VALUES中只包含数据列，不包含分区列（分区列在PARTITION子句中指定）
+                3. **列数匹配**：VALUES中的列数必须与数据列数量完全一致
                 4. 字符串值必须用单引号包围
-                5. 支持批量插入：INSERT INTO TABLE table_name VALUES (row1), (row2), (row3)
+                5. 支持批量插入：INSERT INTO TABLE table_name PARTITION(ds='2025-06-22') VALUES (row1), (row2), (row3)
+                6. **示例**：对于有3个数据列的分区表，正确语法是：
+                   INSERT INTO TABLE products PARTITION(ds='2025-06-22') VALUES ('P001', 'Product A', 10.99)
+                   错误语法：VALUES ('P001', 'Product A', 10.99', '2025-06-22')  -- 不要在VALUES中包含分区列
                 """
             else:  # PostgreSQL and other standard SQL
                 specific_instructions = """
@@ -609,22 +723,38 @@ class DataGeneratorTool(BaseTool):
         try:
             schema = await self.get_table_schema(table_name, ds_name)
             table_info = f"表 {schema['table_name']}:\n"
-            table_info += f"列: {[col['name'] + '(' + str(col['type']) + ')' for col in schema['columns']]}\n"
-            table_info += f"主键: {schema['primary_keys']}\n"
 
-            # 获取主键列的下一个可用ID
-            if schema["primary_keys"]:
-                primary_key = schema["primary_keys"][0]  # 假设只有一个主键
-                next_id = await self._get_next_available_id(
-                    table_name, primary_key, ds_name
-                )
-                table_info += f"下一个可用主键值: {next_id}\n"
-
-            # 如果是Hive分区表，添加分区信息
+            # 区分分区列和非分区列
             if schema.get("is_partitioned", False):
-                table_info += f"分区表 - 分区列: {schema['partition_columns']}\n"
+                # 获取非分区列
+                non_partition_columns = [
+                    col
+                    for col in schema["columns"]
+                    if col["name"] not in schema.get("partition_columns", [])
+                ]
+
+                table_info += f"数据列: {[col['name'] + '(' + str(col['type']) + ')' for col in non_partition_columns]}\n"
+                table_info += (
+                    f"**重要**: 这是分区表，分区列: {schema['partition_columns']}\n"
+                )
+                table_info += f"**注意**: INSERT语句只需要包含数据列，分区列在PARTITION子句中指定\n"
+
                 if schema.get("existing_partitions"):
                     table_info += f"现有分区示例: {schema['existing_partitions'][:3]}\n"
+            else:
+                table_info += f"列: {[col['name'] + '(' + str(col['type']) + ')' for col in schema['columns']]}\n"
+
+            table_info += f"主键: {schema['primary_keys']}\n"
+
+            # 获取主键列的下一个可用ID（仅对非Hive数据库）
+            if schema["primary_keys"]:
+                ds_type = await self._get_datasource_type(ds_name)
+                if ds_type != "hive":  # Hive通常不使用主键
+                    primary_key = schema["primary_keys"][0]  # 假设只有一个主键
+                    next_id = await self._get_next_available_id(
+                        table_name, primary_key, ds_name
+                    )
+                    table_info += f"下一个可用主键值: {next_id}\n"
 
             return table_info
 

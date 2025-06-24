@@ -7,15 +7,29 @@ numpy
 datasets~=3.4.1
 fastapi~=0.115.11
 tiktoken~=0.9.0
-sqlalchemy>=1.4.0,<2.0.0
+sqlalchemy~=1.4.46
 pymysql~=1.1.1
 cryptography~=44.0.2
 
-# Hive连接相关依赖 (compatible with Hive 2.3.3 and SQLAlchemy 1.4.x)
-pyhive[hive]==0.6.5
+# PostgreSQL driver
+psycopg2-binary~=2.9.9
+
+# Oracle driver (optional, uncomment if needed)
+# cx-oracle~=8.3.0
+
+# Hive连接相关依赖 (compatible with Hive 2.3.3, SQLAlchemy 1.4.x and Python 3.12)
+pyhive[hive_pure_sasl]==0.7.0
 thrift==0.16.0
 pure-sasl==0.6.2
 thrift-sasl==0.4.3
+# impyla==0.18.0  # 移除：conda 频道中不可用，且 PyHive 已足够
+
+# 额外的 Hive 支持库
+future==0.18.3
+six==1.16.0
+
+# Python 3.12 兼容的替代方案
+pure-transport==0.1.0  # 为 Python 3.12 提供 thrift transport
 
 html2text~=2024.2.26
 gymnasium~=1.1.1

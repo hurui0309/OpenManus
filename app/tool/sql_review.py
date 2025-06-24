@@ -314,8 +314,14 @@ class SQLReviewTool(BaseTool):
 
             with target_engine.connect() as conn:
                 if ds_type == "hive":
-                    # Hive使用EXPLAIN命令
-                    explain_result = conn.execute(text(f"EXPLAIN {sql}"))
+                    # Hive使用EXPLAIN命令 - 清理SQL并处理分号问题
+                    cleaned_sql = self._clean_sql_for_hive_explain(sql)
+
+                    # 构建EXPLAIN语句
+                    explain_sql = f"EXPLAIN {cleaned_sql}"
+                    logger.debug(f"执行Hive EXPLAIN: {explain_sql}")
+
+                    explain_result = conn.execute(text(explain_sql))
                     plan_text = "\n".join([str(row) for row in explain_result])
 
                     return {
@@ -341,6 +347,35 @@ class SQLReviewTool(BaseTool):
                 "plan": f"无法获取执行计划: {str(e)}",
                 "analysis": {"warnings": [f"执行计划分析失败: {str(e)}"]},
             }
+
+    def _clean_sql_for_hive_explain(self, sql: str) -> str:
+        """清理SQL语句以适配Hive的EXPLAIN命令。
+
+        Args:
+            sql: 原始SQL语句
+
+        Returns:
+            str: 清理后的SQL语句
+        """
+        import re
+
+        # 基本清理
+        cleaned_sql = sql.strip()
+
+        # 移除SQL注释（-- 和 /* */ 样式）
+        cleaned_sql = re.sub(r"--.*?(?:\n|$)", " ", cleaned_sql)
+        cleaned_sql = re.sub(r"/\*.*?\*/", " ", cleaned_sql, flags=re.DOTALL)
+
+        # 移除多余的空白字符
+        cleaned_sql = re.sub(r"\s+", " ", cleaned_sql).strip()
+
+        # 移除末尾的分号，因为Hive的EXPLAIN不需要分号
+        while cleaned_sql.endswith(";"):
+            cleaned_sql = cleaned_sql[:-1].strip()
+
+        logger.debug(f"SQL清理: 原始='{sql[:100]}...' 清理后='{cleaned_sql[:100]}...'")
+
+        return cleaned_sql
 
     def _analyze_hive_plan(self, plan_text: str) -> Dict[str, List[str]]:
         """分析Hive执行计划。
