@@ -631,3 +631,214 @@ class SQLReviewTool(BaseTool):
 
         # 如果无法提取评分，返回默认值
         return 75
+
+    # 在 execute 方法之前添加新的流式执行方法
+    async def execute_stream(self, **kwargs):
+        """执行SQL审查任务的流式版本。
+
+        Args:
+            **kwargs: 包含sql和ds_name参数
+
+        Yields:
+            dict: 流式消息内容
+        """
+        sql = kwargs.get("sql")
+        ds_name = kwargs.get("ds_name")
+
+        if not sql:
+            yield {
+                "content": "❌ **错误**: 缺少必需参数 sql\n\n",
+                "role": "assistant",
+                "type": "error",
+            }
+            return
+
+        try:
+            # 开始分析前的准备工作
+            yield {
+                "content": "🔍 **正在准备SQL审查分析...**\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            # 获取数据源类型
+            ds_type = await self._get_datasource_type(ds_name)
+
+            yield {
+                "content": f"📊 数据源类型: {ds_type.upper()}\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            # 获取数据库模式信息
+            yield {
+                "content": "🗂️ **正在获取数据库模式信息...**\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            schema_info = await self.get_database_schema(ds_name)
+
+            # 分析执行计划
+            yield {
+                "content": "⚙️ **正在分析SQL执行计划...**\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            execution_plan = await self.analyze_sql_execution_plan(sql, ds_name)
+
+            # 获取表级过滤条件建议
+            yield {
+                "content": "🎯 **检查表级过滤条件建议...**\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            filter_suggestions = self.metadata_service.get_filter_suggestions_for_sql(
+                sql
+            )
+
+            # 构建LLM提示词
+            if ds_type == "hive":
+                specific_instructions = """
+                特别注意 - Hive性能优化要点：
+                1. 分区过滤：确保查询包含分区列的过滤条件
+                2. 列式存储：检查是否使用了合适的文件格式（如ORC、Parquet）
+                3. 动态分区：避免产生过多小文件
+                4. JOIN优化：考虑使用map-side join或bucket join
+                5. 数据倾斜：检查是否存在数据倾斜问题
+                6. 避免使用SELECT *，明确指定需要的列
+                7. 合理使用LIMIT来控制输出大小
+                """
+            else:
+                specific_instructions = """
+                MySQL/PostgreSQL性能优化要点：
+                1. 索引使用：确保查询能够有效利用索引
+                2. 避免全表扫描
+                3. JOIN优化：选择合适的JOIN类型和顺序
+                4. 子查询优化：考虑重写为JOIN
+                5. 分页查询：使用LIMIT时考虑添加ORDER BY
+                """
+
+            # 构建消息
+            messages = [{"role": "system", "content": SQL_REVIEW_SYSTEM_PROMPT}]
+
+            # 根据是否有过滤条件建议选择不同的用户提示词
+            if filter_suggestions["has_suggestions"]:
+                missing_filters_alert = build_missing_filters_alert(
+                    filter_suggestions["missing_filters"]
+                )
+                user_prompt = SQL_REVIEW_USER_PROMPT_WITH_FILTERS.format(
+                    sql=sql,
+                    filter_suggestions=filter_suggestions["suggestions_text"],
+                    missing_filters_alert=missing_filters_alert,
+                )
+            else:
+                user_prompt = SQL_REVIEW_USER_PROMPT.format(
+                    sql=sql, filter_suggestions=""
+                )
+
+            # 添加技术分析信息
+            user_prompt += f"""
+
+## 🏗️ 技术分析信息
+
+**数据源**: {ds_name or 'default'} ({ds_type})
+
+**数据库模式信息**:
+{json.dumps(schema_info, indent=2, ensure_ascii=False)}
+
+**执行计划分析**:
+{json.dumps(execution_plan, indent=2, ensure_ascii=False)}
+
+**{ds_type.upper()}性能优化重点**:
+{specific_instructions}
+
+请特别关注以上技术信息，并在您的分析中引用具体的模式和执行计划细节。
+            """
+
+            messages.append({"role": "user", "content": user_prompt})
+            messages.append(
+                {"role": "assistant", "content": SQL_REVIEW_ASSISTANT_PROMPT}
+            )
+
+            # 开始流式调用LLM
+            yield {
+                "content": "🤖 **AI专家正在进行深度分析...**\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            # 流式调用LLM并实时输出
+            full_response = ""
+            async for chunk in self.llm.ask_stream(messages):
+                if chunk:
+                    full_response += chunk
+                    yield {
+                        "content": chunk,
+                        "role": "assistant",
+                        "type": "llm_stream",
+                    }
+
+            # 后处理和保存结果
+            yield {
+                "content": "\n\n---\n\n✅ **分析完成，正在保存结果...**\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
+            # 提取评分
+            score = self._extract_score(full_response)
+
+            # 构建增强的结果
+            enhanced_result = f"""
+=== 🔍 过滤条件建议分析 ===
+{filter_suggestions['message']}
+
+{filter_suggestions.get('suggestions_text', '')}
+
+=== 📊 SQL Review 结果 ===
+{full_response}
+            """.strip()
+
+            # 保存审查结果
+            self._save_review_result(
+                sql,
+                ds_name,
+                enhanced_result,
+                json.dumps(execution_plan, ensure_ascii=False),
+                enhanced_result,
+                score,
+            )
+
+            # 显示最终总结
+            yield {
+                "content": f"📈 **最终评分: {score}/100**\n\n",
+                "role": "assistant",
+                "type": "summary",
+            }
+
+            # 如果有过滤条件建议，单独显示
+            if filter_suggestions["has_suggestions"]:
+                yield {
+                    "content": f"### 🎯 过滤条件建议总结\n\n{filter_suggestions['suggestions_text']}\n\n",
+                    "role": "assistant",
+                    "type": "summary",
+                }
+
+            # 结束标记
+            yield {
+                "content": "",
+                "role": "assistant",
+                "type": "done",
+            }
+
+        except Exception as e:
+            error_msg = f"SQL审查失败: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            yield {
+                "content": f"❌ **系统错误**: {error_msg}\n\n",
+                "role": "assistant",
+                "type": "error",
+            }

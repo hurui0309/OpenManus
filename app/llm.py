@@ -30,7 +30,6 @@ from app.schema import (
     ToolChoice,
 )
 
-
 REASONING_MODELS = ["o1", "o3-mini"]
 MULTIMODAL_MODELS = [
     "gpt-4-vision-preview",
@@ -544,9 +543,7 @@ class LLM:
             multimodal_content = (
                 [{"type": "text", "text": content}]
                 if isinstance(content, str)
-                else content
-                if isinstance(content, list)
-                else []
+                else content if isinstance(content, list) else []
             )
 
             # Add images to content
@@ -770,4 +767,98 @@ class LLM:
             raise
         except Exception as e:
             logger.error(f"Unexpected error in ask_tool: {e}")
+            raise
+
+    async def ask_stream(
+        self,
+        messages: List[Union[dict, Message]],
+        system_msgs: Optional[List[Union[dict, Message]]] = None,
+        temperature: Optional[float] = None,
+    ):
+        """
+        Send a prompt to the LLM and get streaming response.
+
+        Args:
+            messages: List of conversation messages
+            system_msgs: Optional system messages to prepend
+            temperature (float): Sampling temperature for the response
+
+        Yields:
+            str: Streaming response chunks
+
+        Raises:
+            TokenLimitExceeded: If token limits are exceeded
+            ValueError: If messages are invalid or response is empty
+            OpenAIError: If API call fails after retries
+            Exception: For unexpected errors
+        """
+        try:
+            # Check if the model supports images
+            supports_images = self.model in MULTIMODAL_MODELS
+
+            # Format system and user messages with image support check
+            if system_msgs:
+                system_msgs = self.format_messages(system_msgs, supports_images)
+                messages = system_msgs + self.format_messages(messages, supports_images)
+            else:
+                messages = self.format_messages(messages, supports_images)
+
+            # Calculate input token count
+            input_tokens = self.count_message_tokens(messages)
+
+            # Check if token limits are exceeded
+            if not self.check_token_limit(input_tokens):
+                error_message = self.get_limit_error_message(input_tokens)
+                raise TokenLimitExceeded(error_message)
+
+            params = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+            }
+
+            if self.model in REASONING_MODELS:
+                params["max_completion_tokens"] = self.max_tokens
+            else:
+                params["max_tokens"] = self.max_tokens
+                params["temperature"] = (
+                    temperature if temperature is not None else self.temperature
+                )
+
+            # Update estimated token count before making the request
+            self.update_token_count(input_tokens)
+
+            response = await self.client.chat.completions.create(**params)
+
+            completion_text = ""
+            async for chunk in response:
+                chunk_message = chunk.choices[0].delta.content or ""
+                if chunk_message:
+                    completion_text += chunk_message
+                    yield chunk_message
+
+            # Estimate completion tokens for streaming response
+            completion_tokens = self.count_tokens(completion_text)
+            logger.info(
+                f"Estimated completion tokens for streaming response: {completion_tokens}"
+            )
+            self.total_completion_tokens += completion_tokens
+
+        except TokenLimitExceeded:
+            # Re-raise token limit errors without logging
+            raise
+        except ValueError:
+            logger.exception(f"Validation error")
+            raise
+        except OpenAIError as oe:
+            logger.exception(f"OpenAI API error")
+            if isinstance(oe, AuthenticationError):
+                logger.error("Authentication failed. Check API key.")
+            elif isinstance(oe, RateLimitError):
+                logger.error("Rate limit exceeded. Consider increasing retry attempts.")
+            elif isinstance(oe, APIError):
+                logger.error(f"API error: {oe}")
+            raise
+        except Exception:
+            logger.exception(f"Unexpected error in ask_stream")
             raise
