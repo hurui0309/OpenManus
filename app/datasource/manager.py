@@ -623,28 +623,47 @@ class DataSourceManager:
         return len(partition_columns) > 0
 
     async def list_datasources(self) -> list:
-        """列出所有可用的数据源。
+        """列出所有可用的数据源，包含完整配置信息。
 
         Returns:
-            list: 数据源名称列表
+            list: 数据源完整配置列表
         """
         try:
             with self.main_engine.connect() as conn:
                 result = conn.execute(
                     text(
-                        "SELECT ds_name, ds_type, create_time FROM t_datasource_config ORDER BY create_time"
+                        "SELECT ds_name, ds_type, url, user, pwd, properties, "
+                        "created_by, create_time, updated_by, update_time "
+                        "FROM t_datasource_config ORDER BY create_time"
                     )
                 )
-                return [
-                    {
+                datasources = []
+                for row in result.fetchall():
+                    # 解析properties字段
+                    properties = {}
+                    if row.properties:
+                        try:
+                            properties = json.loads(row.properties)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                f"数据源 {row.ds_name} 的properties字段格式错误"
+                            )
+
+                    datasource = {
                         "ds_name": row.ds_name,
                         "ds_type": row.ds_type,
-                        "create_time": (
-                            row.create_time.isoformat() if row.create_time else None
-                        ),
+                        "url": row.url,
+                        "user": row.user,
+                        "pwd": row.pwd,
+                        "properties": properties,
+                        "created_by": row.created_by,
+                        "create_time": row.create_time,
+                        "updated_by": row.updated_by,
+                        "update_time": row.update_time,
                     }
-                    for row in result.fetchall()
-                ]
+                    datasources.append(datasource)
+
+                return datasources
         except SQLAlchemyError as e:
             logger.error(f"获取数据源列表失败: {str(e)}")
             raise DatabaseError(f"获取数据源列表失败: {str(e)}")

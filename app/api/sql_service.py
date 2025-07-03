@@ -15,6 +15,7 @@ from app.config import Config
 from app.datasource import DataSourceManager
 from app.exceptions import DatabaseError
 from app.llm import LLM
+from app.schemas.datasource import DataSourceConfigResponse
 from app.tool.data_generator import DataGeneratorTool
 from app.tool.sql_review import SQLReviewTool
 
@@ -75,7 +76,7 @@ class DataSourceResponse(BaseModel):
 
     success: bool
     message: str
-    data: Optional[List[Dict]] = None
+    data: Optional[List[DataSourceConfigResponse]] = None
 
 
 class DataSourceTestResponse(BaseModel):
@@ -328,13 +329,31 @@ async def process_sql_sync(request: SQLRequest):
 
 @router.get("/datasources", response_model=DataSourceResponse)
 async def list_datasources():
-    """获取所有可用数据源列表。
+    """获取所有可用数据源列表，包含完整配置信息。
 
     Returns:
         DataSourceResponse: 数据源列表响应
     """
     try:
-        datasources = await datasource_manager.list_datasources()
+        datasources_data = await datasource_manager.list_datasources()
+
+        # 将字典数据转换为 DataSourceConfigResponse 模型
+        datasources = []
+        for ds_data in datasources_data:
+            datasource = DataSourceConfigResponse(
+                ds_name=ds_data["ds_name"],
+                ds_type=ds_data["ds_type"],
+                url=ds_data["url"],
+                user=ds_data["user"],
+                pwd=ds_data["pwd"],
+                properties=ds_data["properties"],
+                created_by=ds_data["created_by"],
+                create_time=ds_data["create_time"],
+                updated_by=ds_data["updated_by"],
+                update_time=ds_data["update_time"],
+            )
+            datasources.append(datasource)
+
         return DataSourceResponse(
             success=True, message="获取数据源列表成功", data=datasources
         )

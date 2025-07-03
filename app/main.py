@@ -3,7 +3,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.datasource_config import router as datasource_config_router
 from app.api.sql_service import router as sql_router
+from app.api.user import router as user_router
 
 app = FastAPI(
     title="OpenManus API", description="OpenManus SQL 服务 API", version="1.0.0"
@@ -21,6 +23,7 @@ app.add_middleware(
         "Accept",
         "Origin",
         "X-Requested-With",
+        "X-User-ID",
         "Cache-Control",
         "Access-Control-Request-Method",
         "Access-Control-Request-Headers",
@@ -31,6 +34,8 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(sql_router)
+app.include_router(datasource_config_router)
+app.include_router(user_router)
 
 if __name__ == "__main__":
     import uvicorn
