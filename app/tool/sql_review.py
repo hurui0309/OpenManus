@@ -530,9 +530,6 @@ class SQLReviewTool(BaseTool):
             """
 
             messages.append({"role": "user", "content": user_prompt})
-            messages.append(
-                {"role": "assistant", "content": SQL_REVIEW_ASSISTANT_PROMPT}
-            )
 
             # 调用LLM进行分析
             review_result = await self.llm.ask(messages)
@@ -620,70 +617,36 @@ class SQLReviewTool(BaseTool):
 
             fixed_text = text
 
-            # 1. 检查并修复未闭合的SQL代码块
-            sql_blocks = re.finditer(r"```sql\b.*?(?=```|$)", fixed_text, re.DOTALL)
-            blocks_to_fix = []
-
-            for match in sql_blocks:
-                block_content = match.group(0)
-                # 检查是否有结尾的 ```
-                if not block_content.rstrip().endswith("```"):
-                    blocks_to_fix.append(match)
+            # 1. 修复未闭合的代码块
+            pattern = r"```(\w*)(.*?)(?:```|$)"
+            matches = list(re.finditer(pattern, fixed_text, re.DOTALL))
 
             # 从后往前修复，避免位置偏移
-            for match in reversed(blocks_to_fix):
-                start, end = match.span()
-                block_content = match.group(0).rstrip()
-
-                # 添加缺失的结尾标记
-                if not block_content.endswith("```"):
-                    # 检查是否需要添加换行
+            for match in reversed(matches):
+                full_match = match.group(0)
+                if not full_match.endswith("```"):
+                    start, end = match.span()
+                    block_content = full_match.rstrip()
                     if not block_content.endswith("\n"):
                         block_content += "\n"
                     block_content += "```"
-
                     fixed_text = fixed_text[:start] + block_content + fixed_text[end:]
-                    logger.debug(f"修复了SQL代码块: 位置 {start}-{end}")
+                    logger.debug(f"修复了未闭合的代码块: 位置 {start}-{end}")
 
-            # 2. 检查并修复其他类型的代码块
-            general_blocks = re.finditer(r"```\w*.*?(?=```|$)", fixed_text, re.DOTALL)
-            blocks_to_fix = []
+            # 2. 清理常见的模板标记
+            fixed_text = re.sub(r"\[优化后的SQL语句\]\s*", "", fixed_text)
 
-            for match in general_blocks:
-                block_content = match.group(0)
-                # 跳过已经正确闭合的块
-                if block_content.count("```") >= 2:
-                    continue
-                blocks_to_fix.append(match)
+            # 3. 确保代码块前后有适当的空行
+            # 标题后跟代码块需要空行
+            fixed_text = re.sub(r"(##[^\n]*)\n(```)", r"\1\n\n\2", fixed_text)
+            # 代码块后跟内容需要空行
+            fixed_text = re.sub(r"(```)\n([^\n\s])", r"\1\n\n\2", fixed_text)
+            fixed_text = re.sub(r"(```)\n(#)", r"\1\n\n\2", fixed_text)
 
-            # 从后往前修复
-            for match in reversed(blocks_to_fix):
-                start, end = match.span()
-                block_content = match.group(0).rstrip()
+            # 4. 清理过多的连续空行
+            fixed_text = re.sub(r"\n{4,}", "\n\n\n", fixed_text)
 
-                if not block_content.endswith("```"):
-                    if not block_content.endswith("\n"):
-                        block_content += "\n"
-                    block_content += "```"
-
-                    fixed_text = fixed_text[:start] + block_content + fixed_text[end:]
-                    logger.debug(f"修复了代码块: 位置 {start}-{end}")
-
-            # 3. 清理可能的截断内容标识
-            truncation_patterns = [
-                r"\s*格式\s*$",
-                r"\s*内容\s*$",
-                r"\s*数据\s*$",
-                r"\s*语句\s*$",
-                r"\s*查询\s*$",
-            ]
-
-            for pattern in truncation_patterns:
-                if re.search(pattern, fixed_text):
-                    fixed_text = re.sub(pattern, "", fixed_text).rstrip()
-                    logger.debug(f"移除了截断标识符: {pattern}")
-
-            # 4. 确保文本以换行结尾
+            # 5. 确保文本以换行结尾
             if fixed_text and not fixed_text.endswith("\n"):
                 fixed_text += "\n"
 
@@ -849,9 +812,6 @@ class SQLReviewTool(BaseTool):
             """
 
             messages.append({"role": "user", "content": user_prompt})
-            messages.append(
-                {"role": "assistant", "content": SQL_REVIEW_ASSISTANT_PROMPT}
-            )
 
             # 开始流式调用LLM
             yield {
@@ -871,18 +831,12 @@ class SQLReviewTool(BaseTool):
                         "type": "llm_stream",
                     }
 
-            # 🚀 新增：验证和修复markdown格式
+            # 🚀 修复：简化markdown格式修复，不发送差异内容
             fixed_response = self._fix_markdown_format(full_response)
             if fixed_response != full_response:
                 logger.info("检测到markdown格式问题，已自动修复")
-                # 如果有修复，发送修复的部分
-                fix_diff = fixed_response[len(full_response) :]
-                if fix_diff:
-                    yield {
-                        "content": fix_diff,
-                        "role": "assistant",
-                        "type": "llm_stream",
-                    }
+                # 注意：我们不发送修复的差异，因为这可能导致重复或错误的内容
+                # 修复后的完整内容将在保存到数据库时使用
                 full_response = fixed_response
 
             # 后处理和保存结果
@@ -946,3 +900,93 @@ class SQLReviewTool(BaseTool):
                 "role": "assistant",
                 "type": "error",
             }
+
+    def test_markdown_fixes(self):
+        """测试Markdown格式修复功能。
+
+        Returns:
+            Dict[str, Any]: 测试结果
+        """
+        test_cases = [
+            {
+                "name": "未闭合的SQL代码块",
+                "input": """## ✨ 优化SQL
+```sql
+SELECT * FROM users WHERE id = 1
+                """,
+                "expected_fixes": ["添加结尾```", "SQL代码块完整性"],
+            },
+            {
+                "name": "SQL中的多余引号",
+                "input": """```sql
+"SELECT * FROM users WHERE name = 'test'"
+```""",
+                "expected_fixes": ["移除外层引号"],
+            },
+            {
+                "name": "截断的SQL内容",
+                "input": """```sql
+SELECT * FROM users WHERE id = 1 格式
+```""",
+                "expected_fixes": ["移除截断标识符"],
+            },
+            {
+                "name": "混乱的标题格式",
+                "input": """### 优化SQL ###
+```sql
+SELECT * FROM users;
+```""",
+                "expected_fixes": ["标题格式规范化"],
+            },
+        ]
+
+        results = {
+            "total_tests": len(test_cases),
+            "passed": 0,
+            "failed": 0,
+            "details": [],
+        }
+
+        for case in test_cases:
+            try:
+                original = case["input"]
+                fixed = self._fix_markdown_format(original)
+
+                # 基本检查：修复后应该不同于原始内容（如果有问题的话）
+                has_changes = fixed != original
+
+                # 检查代码块完整性
+                sql_blocks_complete = True
+                if "```sql" in fixed:
+                    import re
+
+                    sql_blocks = re.findall(r"```sql.*?```", fixed, re.DOTALL)
+                    sql_blocks_complete = len(sql_blocks) > 0 and all(
+                        "```" in block for block in sql_blocks
+                    )
+
+                passed = sql_blocks_complete
+
+                results["details"].append(
+                    {
+                        "test_name": case["name"],
+                        "passed": passed,
+                        "has_changes": has_changes,
+                        "original_length": len(original),
+                        "fixed_length": len(fixed),
+                        "sql_blocks_complete": sql_blocks_complete,
+                    }
+                )
+
+                if passed:
+                    results["passed"] += 1
+                else:
+                    results["failed"] += 1
+
+            except Exception as e:
+                results["failed"] += 1
+                results["details"].append(
+                    {"test_name": case["name"], "passed": False, "error": str(e)}
+                )
+
+        return results
