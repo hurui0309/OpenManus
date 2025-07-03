@@ -537,6 +537,9 @@ class SQLReviewTool(BaseTool):
             # 调用LLM进行分析
             review_result = await self.llm.ask(messages)
 
+            # 🚀 新增：修复markdown格式
+            review_result = self._fix_markdown_format(review_result)
+
             # 提取评分（简单的文本分析）
             score = self._extract_score(review_result)
 
@@ -602,6 +605,93 @@ class SQLReviewTool(BaseTool):
             error_msg = f"SQL审查失败: {str(e)}"
             logger.error(error_msg, exc_info=True)
             return ToolResult(error=error_msg)
+
+    def _fix_markdown_format(self, text: str) -> str:
+        """修复markdown格式问题，确保代码块完整性。
+
+        Args:
+            text: 原始文本
+
+        Returns:
+            str: 修复后的文本
+        """
+        try:
+            import re
+
+            fixed_text = text
+
+            # 1. 检查并修复未闭合的SQL代码块
+            sql_blocks = re.finditer(r"```sql\b.*?(?=```|$)", fixed_text, re.DOTALL)
+            blocks_to_fix = []
+
+            for match in sql_blocks:
+                block_content = match.group(0)
+                # 检查是否有结尾的 ```
+                if not block_content.rstrip().endswith("```"):
+                    blocks_to_fix.append(match)
+
+            # 从后往前修复，避免位置偏移
+            for match in reversed(blocks_to_fix):
+                start, end = match.span()
+                block_content = match.group(0).rstrip()
+
+                # 添加缺失的结尾标记
+                if not block_content.endswith("```"):
+                    # 检查是否需要添加换行
+                    if not block_content.endswith("\n"):
+                        block_content += "\n"
+                    block_content += "```"
+
+                    fixed_text = fixed_text[:start] + block_content + fixed_text[end:]
+                    logger.debug(f"修复了SQL代码块: 位置 {start}-{end}")
+
+            # 2. 检查并修复其他类型的代码块
+            general_blocks = re.finditer(r"```\w*.*?(?=```|$)", fixed_text, re.DOTALL)
+            blocks_to_fix = []
+
+            for match in general_blocks:
+                block_content = match.group(0)
+                # 跳过已经正确闭合的块
+                if block_content.count("```") >= 2:
+                    continue
+                blocks_to_fix.append(match)
+
+            # 从后往前修复
+            for match in reversed(blocks_to_fix):
+                start, end = match.span()
+                block_content = match.group(0).rstrip()
+
+                if not block_content.endswith("```"):
+                    if not block_content.endswith("\n"):
+                        block_content += "\n"
+                    block_content += "```"
+
+                    fixed_text = fixed_text[:start] + block_content + fixed_text[end:]
+                    logger.debug(f"修复了代码块: 位置 {start}-{end}")
+
+            # 3. 清理可能的截断内容标识
+            truncation_patterns = [
+                r"\s*格式\s*$",
+                r"\s*内容\s*$",
+                r"\s*数据\s*$",
+                r"\s*语句\s*$",
+                r"\s*查询\s*$",
+            ]
+
+            for pattern in truncation_patterns:
+                if re.search(pattern, fixed_text):
+                    fixed_text = re.sub(pattern, "", fixed_text).rstrip()
+                    logger.debug(f"移除了截断标识符: {pattern}")
+
+            # 4. 确保文本以换行结尾
+            if fixed_text and not fixed_text.endswith("\n"):
+                fixed_text += "\n"
+
+            return fixed_text
+
+        except Exception as e:
+            logger.warning(f"Markdown格式修复失败: {e}")
+            return text
 
     def _extract_score(self, review_text: str) -> int:
         """从审查结果中提取评分。
@@ -780,6 +870,20 @@ class SQLReviewTool(BaseTool):
                         "role": "assistant",
                         "type": "llm_stream",
                     }
+
+            # 🚀 新增：验证和修复markdown格式
+            fixed_response = self._fix_markdown_format(full_response)
+            if fixed_response != full_response:
+                logger.info("检测到markdown格式问题，已自动修复")
+                # 如果有修复，发送修复的部分
+                fix_diff = fixed_response[len(full_response) :]
+                if fix_diff:
+                    yield {
+                        "content": fix_diff,
+                        "role": "assistant",
+                        "type": "llm_stream",
+                    }
+                full_response = fixed_response
 
             # 后处理和保存结果
             yield {

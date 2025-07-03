@@ -646,6 +646,93 @@ class DataGeneratorTool(BaseTool):
 
         return ""
 
+    def _fix_markdown_format(self, text: str) -> str:
+        """修复markdown格式问题，确保代码块完整性。
+
+        Args:
+            text: 原始文本
+
+        Returns:
+            str: 修复后的文本
+        """
+        try:
+            import re
+
+            fixed_text = text
+
+            # 1. 检查并修复未闭合的SQL代码块
+            sql_blocks = re.finditer(r"```sql\b.*?(?=```|$)", fixed_text, re.DOTALL)
+            blocks_to_fix = []
+
+            for match in sql_blocks:
+                block_content = match.group(0)
+                # 检查是否有结尾的 ```
+                if not block_content.rstrip().endswith("```"):
+                    blocks_to_fix.append(match)
+
+            # 从后往前修复，避免位置偏移
+            for match in reversed(blocks_to_fix):
+                start, end = match.span()
+                block_content = match.group(0).rstrip()
+
+                # 添加缺失的结尾标记
+                if not block_content.endswith("```"):
+                    # 检查是否需要添加换行
+                    if not block_content.endswith("\n"):
+                        block_content += "\n"
+                    block_content += "```"
+
+                    fixed_text = fixed_text[:start] + block_content + fixed_text[end:]
+                    logger.debug(f"修复了SQL代码块: 位置 {start}-{end}")
+
+            # 2. 检查并修复其他类型的代码块
+            general_blocks = re.finditer(r"```\w*.*?(?=```|$)", fixed_text, re.DOTALL)
+            blocks_to_fix = []
+
+            for match in general_blocks:
+                block_content = match.group(0)
+                # 跳过已经正确闭合的块
+                if block_content.count("```") >= 2:
+                    continue
+                blocks_to_fix.append(match)
+
+            # 从后往前修复
+            for match in reversed(blocks_to_fix):
+                start, end = match.span()
+                block_content = match.group(0).rstrip()
+
+                if not block_content.endswith("```"):
+                    if not block_content.endswith("\n"):
+                        block_content += "\n"
+                    block_content += "```"
+
+                    fixed_text = fixed_text[:start] + block_content + fixed_text[end:]
+                    logger.debug(f"修复了代码块: 位置 {start}-{end}")
+
+            # 3. 清理可能的截断内容标识
+            truncation_patterns = [
+                r"\s*格式\s*$",
+                r"\s*内容\s*$",
+                r"\s*数据\s*$",
+                r"\s*语句\s*$",
+                r"\s*查询\s*$",
+            ]
+
+            for pattern in truncation_patterns:
+                if re.search(pattern, fixed_text):
+                    fixed_text = re.sub(pattern, "", fixed_text).rstrip()
+                    logger.debug(f"移除了截断标识符: {pattern}")
+
+            # 4. 确保文本以换行结尾
+            if fixed_text and not fixed_text.endswith("\n"):
+                fixed_text += "\n"
+
+            return fixed_text
+
+        except Exception as e:
+            logger.warning(f"Markdown格式修复失败: {e}")
+            return text
+
     def _build_parse_error_detail(
         self, response: str, sql_block_count: int, is_truncated: bool
     ) -> str:
@@ -1110,13 +1197,15 @@ class DataGeneratorTool(BaseTool):
                     f"❌ **SQL解析失败**\n\n**详细信息**: {error_detail}\n\n"
                 )
 
-                # 添加LLM响应预览（用于调试）
+                # 🚀 新增：修复响应预览的markdown格式
                 response_preview = (
                     full_response[:300] if len(full_response) > 300 else full_response
                 )
-                detailed_error_msg += (
-                    f"**LLM响应预览**: \n```\n{response_preview}\n```\n\n"
+                # 确保代码块格式完整
+                fixed_preview = self._fix_markdown_format(
+                    f"```\n{response_preview}\n```"
                 )
+                detailed_error_msg += f"**LLM响应预览**: \n{fixed_preview}\n\n"
 
                 # 添加排查建议
                 detailed_error_msg += "**排查建议**:\n"
@@ -1290,6 +1379,9 @@ class DataGeneratorTool(BaseTool):
 
             # 调用LLM生成SQL
             response = await self.llm.ask([{"role": "user", "content": prompt}])
+
+            # 🚀 新增：修复响应的markdown格式
+            response = self._fix_markdown_format(response)
 
             # 解析生成的SQL
             generated_sql, error_detail = self._parse_generated_sql(response)
@@ -2529,7 +2621,9 @@ class DataGeneratorTool(BaseTool):
             report_lines.append(f"**错误信息**: {error['error_message']}")
             report_lines.append("")
 
-        return "\n".join(report_lines)
+        report_content = "\n".join(report_lines)
+        # 🚀 新增：确保错误报告的markdown格式正确
+        return self._fix_markdown_format(report_content)
 
     def _estimate_affected_rows(self, sql_statement: str) -> int:
         """预估SQL语句影响的行数。
