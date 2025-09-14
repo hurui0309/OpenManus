@@ -535,8 +535,13 @@ class DataSourceManager:
         try:
             engine = await self.get_engine(ds_name)
             with engine.connect() as conn:
-                # 获取分区信息
-                result = conn.execute(text(f"SHOW PARTITIONS {table_name}"))
+                # 获取分区信息（支持 db.table 并添加反引号）
+                if "." in table_name:
+                    db, tbl = table_name.split(".", 1)
+                    fq_name = f"`{db}`.`{tbl}`"
+                else:
+                    fq_name = f"`{table_name}`"
+                result = conn.execute(text(f"SHOW PARTITIONS {fq_name}"))
                 partitions = []
 
                 for row in result:
@@ -577,8 +582,13 @@ class DataSourceManager:
         try:
             engine = await self.get_engine(ds_name)
             with engine.connect() as conn:
-                # 描述表结构
-                result = conn.execute(text(f"DESCRIBE {table_name}"))
+                # 描述表结构（支持 db.table 并添加反引号）
+                if "." in table_name:
+                    db, tbl = table_name.split(".", 1)
+                    fq_name = f"`{db}`.`{tbl}`"
+                else:
+                    fq_name = f"`{table_name}`"
+                result = conn.execute(text(f"DESCRIBE {fq_name}"))
                 partition_columns = []
                 in_partition_section = False
 

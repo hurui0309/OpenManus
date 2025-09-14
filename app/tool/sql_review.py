@@ -164,12 +164,13 @@ class SQLReviewTool(BaseTool):
             logger.error(f"保存审查结果失败: {str(e)}")
 
     async def get_database_schema(
-        self, ds_name: Optional[str] = None
+        self, ds_name: Optional[str] = None, sql_text: Optional[str] = None
     ) -> Dict[str, Any]:
         """获取数据库模式信息。
 
         Args:
             ds_name: 数据源名称
+            sql_text: 可选，用户输入的SQL，用于解析涉及到的表，从而避免全库扫描
 
         Returns:
             Dict[str, Any]: 数据库模式信息
@@ -178,9 +179,9 @@ class SQLReviewTool(BaseTool):
             target_engine = await self._get_target_engine(ds_name)
             ds_type = await self._get_datasource_type(ds_name)
 
-            # 对于Hive，使用特殊方法获取表信息
+            # 对于Hive，使用仅针对SQL涉及表的轻量方法，避免 SHOW TABLES 全库扫描
             if ds_type == "hive":
-                return await self._get_hive_database_schema(ds_name)
+                return await self._get_hive_database_schema(ds_name, sql_text)
             else:
                 inspector = inspect(target_engine)
 
@@ -212,83 +213,125 @@ class SQLReviewTool(BaseTool):
             logger.error(f"获取数据库模式失败: {str(e)}")
             return {"tables": {}}
 
-    async def _get_hive_database_schema(self, ds_name: str) -> Dict[str, Any]:
-        """获取Hive数据库模式信息。
+    def _parse_hive_tables(self, sql_text: Optional[str]) -> List[str]:
+        """从SQL中解析涉及到的表名（支持 db.table 与 table）。
 
-        Args:
-            ds_name: 数据源名称
+        返回去重且保持顺序的列表。
+        """
+        if not sql_text:
+            return []
+        import re
 
-        Returns:
-            Dict[str, Any]: Hive数据库模式信息
+        pattern = re.compile(
+            r"\bfrom\s+([a-zA-Z0-9_\.]+)|\bjoin\s+([a-zA-Z0-9_\.]+)", re.IGNORECASE
+        )
+        found: List[str] = []
+        for m in pattern.finditer(sql_text):
+            token = m.group(1) or m.group(2)
+            if not token:
+                continue
+            found.append(token)
+        # 去重并保持顺序（大小写不敏感，统一按小写去重）
+        seen = set()
+        result: List[str] = []
+        for t in found:
+            key = t.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(t)
+        return result
+
+    async def _get_hive_database_schema(
+        self, ds_name: str, sql_text: Optional[str]
+    ) -> Dict[str, Any]:
+        """获取Hive数据库模式信息（仅针对SQL涉及的表）。
+
+        为避免 `SHOW TABLES` 带来的全库扫描，仅对 SQL 中出现的表执行 DESCRIBE；
+        若无法解析到任何表，则返回空结构。
         """
         try:
             target_engine = await self._get_target_engine(ds_name)
-            schema_info = {"tables": {}}
+            schema_info: Dict[str, Any] = {"tables": {}}
+
+            tables = self._parse_hive_tables(sql_text)
+            if not tables:
+                logger.info("未在SQL中解析到表名，跳过Hive全库扫描，返回空的模式信息。")
+                return schema_info
 
             with target_engine.connect() as conn:
-                # 获取所有表
-                result = conn.execute(text("SHOW TABLES"))
-                tables = [row[0] for row in result]
-
-                for table in tables:
+                for table_ident in tables[:50]:  # 加一个上限，避免过多请求
                     try:
+                        # 允许 db.table 或 table，两者都交给 Hive 解析；这里尽量为标识符加上反引号
+                        if "." in table_ident:
+                            db, tbl = table_ident.split(".", 1)
+                            fq_name = f"`{db}`.`{tbl}`"
+                            table_key = f"{db}.{tbl}"
+                        else:
+                            fq_name = f"`{table_ident}`"
+                            table_key = table_ident
+
                         # 获取表结构描述
-                        result = conn.execute(text(f"DESCRIBE {table}"))
-                        columns = []
-                        partition_columns = []
+                        result = conn.execute(text(f"DESCRIBE {fq_name}"))
+                        columns: List[Dict[str, Any]] = []
+                        partition_columns: List[Dict[str, Any]] = []
                         in_partition_section = False
 
                         for row in result:
-                            col_name = (
-                                row[0]
-                                if isinstance(row, tuple)
-                                else str(row).split()[0]
-                            )
-                            col_type = (
-                                row[1]
-                                if isinstance(row, tuple) and len(row) > 1
-                                else "string"
-                            )
+                            # row 可能是 Row/tuple，做兼容处理
+                            if isinstance(row, tuple):
+                                col_name = row[0]
+                                col_type = row[1] if len(row) > 1 else "string"
+                                row_str0 = str(row[0])
+                            else:
+                                # 退化处理
+                                segs = str(row).split()
+                                col_name = segs[0] if segs else None
+                                col_type = segs[1] if len(segs) > 1 else "string"
+                                row_str0 = str(row)
 
                             if (
-                                "# Partition Information" in str(row)
-                                or "partition_columns" in str(row).lower()
+                                "# Partition Information" in row_str0
+                                or "partition_columns" in row_str0.lower()
                             ):
                                 in_partition_section = True
                                 continue
 
                             if (
                                 col_name
-                                and not col_name.startswith("#")
+                                and not str(col_name).startswith("#")
                                 and col_name != "col_name"
                             ):
                                 col_info = {"name": col_name, "type": col_type}
-
                                 if in_partition_section:
                                     partition_columns.append(col_info)
                                 else:
                                     columns.append(col_info)
 
-                        # 获取分区信息
-                        partitions = []
+                        # 获取分区信息（仅在检测到分区列时尝试）
+                        partitions: List[Dict[str, Any]] = []
                         if partition_columns:
-                            partitions = (
-                                await self.datasource_manager.get_table_partitions(
-                                    table, ds_name
+                            try:
+                                partitions = (
+                                    await self.datasource_manager.get_table_partitions(
+                                        (
+                                            table_key
+                                            if "." not in table_key
+                                            else table_key
+                                        ),
+                                        ds_name,
+                                    )
                                 )
-                            )
+                            except Exception as e:
+                                logger.debug(f"获取 {table_key} 分区信息失败: {e}")
+                                partitions = []
 
-                        schema_info["tables"][table] = {
+                        schema_info["tables"][table_key] = {
                             "columns": columns,
-                            "partition_columns": partition_columns,
-                            "partitions": partitions[:5],  # 只显示前5个分区
-                            "is_partitioned": len(partition_columns) > 0,
-                            "indexes": [],  # Hive表通常没有传统索引
-                            "primary_keys": [],  # Hive通常没有主键
+                            "partition_columns": [c["name"] for c in partition_columns],
+                            "partitions": partitions,
                         }
-
                     except Exception as e:
-                        logger.warning(f"获取Hive表 {table} 信息失败: {str(e)}")
+                        logger.warning(f"获取表 {table_ident} 信息失败: {str(e)}")
 
             return schema_info
 
@@ -456,8 +499,8 @@ class SQLReviewTool(BaseTool):
             # 获取数据源类型
             ds_type = await self._get_datasource_type(ds_name)
 
-            # 获取数据库模式信息
-            schema_info = await self.get_database_schema(ds_name)
+            # 获取数据库模式信息（传入SQL，避免Hive全库扫描）
+            schema_info = await self.get_database_schema(ds_name, sql)
 
             # 分析执行计划
             execution_plan = await self.analyze_sql_execution_plan(sql, ds_name)
@@ -730,7 +773,7 @@ class SQLReviewTool(BaseTool):
                 "type": "text",
             }
 
-            schema_info = await self.get_database_schema(ds_name)
+            schema_info = await self.get_database_schema(ds_name, sql)
 
             # 分析执行计划
             yield {

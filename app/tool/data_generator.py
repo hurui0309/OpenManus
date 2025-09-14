@@ -102,6 +102,72 @@ class DataGeneratorTool(BaseTool):
         else:
             return self.config.database.driver.lower()
 
+    async def _apply_hive_queue(self, conn, ds_name: Optional[str]) -> None:
+        """为Hive写入会话设置YARN队列（从数据源扩展配置properties解析）。
+
+        优先级（从properties解析）：
+        1) 明确的引擎专属键：'tez.queue.name' / 'spark.yarn.queue' / 'mapreduce.job.queuename'
+        2) 通用别名：'hive_queue' 或 'queue'
+        3) 引擎选择：'hive.execution.engine' 或 'execution_engine'（tez/spark/mapreduce）
+
+        当无法判定具体引擎且存在通用队列名时，将同时设置三种键，通常是安全的。
+        """
+        if not ds_name:
+            return
+        try:
+            config = await self.datasource_manager.get_datasource_config(ds_name)
+            props = (config.properties or {}) if hasattr(config, "properties") else {}
+
+            # 明确键优先
+            tez_queue = props.get("tez.queue.name")
+            spark_queue = props.get("spark.yarn.queue")
+            mr_queue = props.get("mapreduce.job.queuename")
+
+            # 通用别名
+            generic_queue = props.get("hive_queue") or props.get("queue")
+
+            # 引擎判断
+            engine_hint = (
+                props.get("hive.execution.engine")
+                or props.get("execution_engine")
+                or ""
+            ).lower()
+
+            cmds = []
+
+            if tez_queue:
+                cmds.append(("tez.queue.name", tez_queue))
+            if spark_queue:
+                cmds.append(("spark.yarn.queue", spark_queue))
+            if mr_queue:
+                cmds.append(("mapreduce.job.queuename", mr_queue))
+
+            if not cmds and generic_queue:
+                # 根据引擎提示设置，否则三种都设置
+                if engine_hint in ("tez",):
+                    cmds.append(("tez.queue.name", generic_queue))
+                elif engine_hint in ("spark", "spark2"):  # 兼容可能的命名
+                    cmds.append(("spark.yarn.queue", generic_queue))
+                elif engine_hint in ("mr", "mapreduce", "mr3"):
+                    cmds.append(("mapreduce.job.queuename", generic_queue))
+                else:
+                    cmds.extend(
+                        [
+                            ("tez.queue.name", generic_queue),
+                            ("mapreduce.job.queuename", generic_queue),
+                            ("spark.yarn.queue", generic_queue),
+                        ]
+                    )
+
+            for key, val in cmds:
+                try:
+                    conn.execute(text(f"SET {key}={val}"))
+                    logger.info(f"已设置Hive队列: {key}={val}")
+                except Exception as e:
+                    logger.debug(f"设置Hive队列 {key} 失败: {e}")
+        except Exception as e:
+            logger.debug(f"解析或设置Hive队列失败: {e}")
+
     def _ensure_log_table(self) -> None:
         """确保数据生成日志表存在。"""
         try:
@@ -252,8 +318,13 @@ class DataGeneratorTool(BaseTool):
             target_engine = await self._get_target_engine(ds_name)
 
             with target_engine.connect() as conn:
-                # 获取表结构描述
-                result = conn.execute(text(f"DESCRIBE {table_name}"))
+                # 获取表结构描述（支持 db.table 并添加反引号）
+                if "." in table_name:
+                    db, tbl = table_name.split(".", 1)
+                    fq_name = f"`{db}`.`{tbl}`"
+                else:
+                    fq_name = f"`{table_name}`"
+                result = conn.execute(text(f"DESCRIBE {fq_name}"))
                 columns = []
                 partition_columns = []
                 in_partition_section = False
@@ -332,26 +403,36 @@ class DataGeneratorTool(BaseTool):
 
     def extract_table_names(self, sql: str) -> List[str]:
         """从SQL语句中提取表名。"""
-        # 简单的正则表达式提取，可能需要更复杂的解析
+        # 简单而健壮的正则提取：支持 db.table 与单表、反引号包裹标识符
         import re
 
-        # 匹配 FROM 和 JOIN 后面的表名
-        patterns = [
-            r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            r"\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            r"\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            r"\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-        ]
+        # 支持的前缀关键字
+        prefixes = ["FROM", "JOIN", "INTO", "UPDATE"]
+        # 形如：FROM db.table 或 FROM table（均可带反引号）
+        ident = r"[`a-zA-Z_][`a-zA-Z0-9_]*"
+        pattern_tpl = rf"\b{{kw}}\s+({ident}(?:\s*\.\s*{ident})?)"
 
-        tables = []
-        for pattern in patterns:
-            matches = re.finditer(pattern, sql, re.IGNORECASE)
-            for match in matches:
-                table_name = match.group(1)
-                if table_name not in tables:
-                    tables.append(table_name)
+        seen = set()
+        result: List[str] = []
+        for kw in prefixes:
+            pattern = pattern_tpl.format(kw=kw)
+            for m in re.finditer(pattern, sql, re.IGNORECASE):
+                token = m.group(1).strip()
+                # 规范化：去除多余空格并移除反引号，保留 db.table 结构
+                token = token.replace(" ", "")
+                if "." in token:
+                    db, tbl = token.split(".", 1)
+                    db = db.strip("`")
+                    tbl = tbl.strip("`")
+                    normalized = f"{db}.{tbl}"
+                else:
+                    normalized = token.strip("`")
+                key = normalized.lower()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(normalized)
 
-        return tables
+        return result
 
     def _parse_generated_sql(self, response: str) -> Tuple[str, str]:
         """解析LLM生成的响应，提取SQL语句。
@@ -923,6 +1004,8 @@ class DataGeneratorTool(BaseTool):
             with target_engine.connect() as conn:
                 # 对于Hive，先设置必要的参数
                 if ds_type == "hive":
+                    # 优先设置YARN队列（如有配置）
+                    await self._apply_hive_queue(conn, ds_name)
                     # 设置动态分区参数
                     conn.execute(text("SET hive.exec.dynamic.partition = true"))
                     conn.execute(
