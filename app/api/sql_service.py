@@ -8,9 +8,8 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
-from app.agent.sql_agent import SQLAgent
 from app.config import Config
 from app.datasource import DataSourceManager
 from app.exceptions import DatabaseError
@@ -18,6 +17,7 @@ from app.llm import LLM
 from app.schemas.datasource import DataSourceConfigResponse
 from app.tool.data_generator import DataGeneratorTool
 from app.tool.sql_review import SQLReviewTool
+from app.tool.text_parser import get_text_parser
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ def get_cors_headers():
 
 
 @router.options("/process")
-@router.options("/process_sync")
 @router.options("/datasources")
 @router.options("/datasources/names")
 @router.options("/datasources/{ds_name}/test")
@@ -59,16 +58,23 @@ class SQLRequest(BaseModel):
     """SQL请求模型。"""
 
     task_type: TaskType = TaskType.REVIEW  # 默认为 SQL 审查
-    sql: str
+    sql: Optional[str] = None  # SQL语句（review任务必填）
     ds_name: Optional[str] = None  # 数据源名称，可选，默认使用主数据源
+    user_id: Optional[str] = None  # 用户ID，用于日志记录和权限控制
+    # 造数任务使用mixed_input字段，包含SQL和用户要求的混合文本，由后端自动解析
+    mixed_input: Optional[str] = None  # 包含SQL和用户要求的混合文本（造数任务专用）
 
-
-class SQLResponse(BaseModel):
-    """SQL响应模型。"""
-
-    status: str
-    message: str
-    data: Optional[dict] = None
+    @field_validator("sql", "mixed_input")
+    @classmethod
+    def validate_task_fields(cls, v, info):
+        """验证任务类型与字段的匹配性。"""
+        if info.data.get("task_type") == TaskType.REVIEW:
+            if info.field_name == "sql" and not v:
+                raise ValueError("SQL审查任务需要提供sql字段")
+        elif info.data.get("task_type") == TaskType.DATA_GENERATION:
+            if info.field_name == "mixed_input" and not v:
+                raise ValueError("数据生成任务需要提供mixed_input字段")
+        return v
 
 
 class DataSourceResponse(BaseModel):
@@ -93,7 +99,11 @@ datasource_manager = DataSourceManager(config)
 
 
 async def process_sql_task(
-    task_type: TaskType, sql: str, ds_name: Optional[str] = None
+    task_type: TaskType,
+    sql: str,
+    ds_name: Optional[str] = None,
+    requirements: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """处理SQL任务的流式对话生成器，类似ChatGPT模式。
 
@@ -101,6 +111,8 @@ async def process_sql_task(
         task_type: 任务类型
         sql: SQL语句
         ds_name: 数据源名称
+        requirements: 用户特殊要求（从mixed_input解析得到，仅在数据生成时使用）
+        user_id: 用户ID，用于日志记录
 
     Yields:
         dict: 包含流式对话内容的字典
@@ -113,6 +125,14 @@ async def process_sql_task(
             "type": "text",
         }
 
+        # 如果是数据生成且有用户要求，显示要求信息
+        if task_type == TaskType.DATA_GENERATION and requirements:
+            yield {
+                "content": f"📋 **用户要求**: {requirements}\n\n",
+                "role": "assistant",
+                "type": "text",
+            }
+
         # 检查数据源连接
         if ds_name:
             yield {
@@ -121,26 +141,26 @@ async def process_sql_task(
                 "type": "text",
             }
 
-            # 测试数据源连接
-            connection_ok = await datasource_manager.test_connection(ds_name)
-            if not connection_ok:
+            try:
+                # 测试数据源连接
+                await datasource_manager.test_connection(ds_name)
                 yield {
-                    "content": f"❌ **错误：数据源 `{ds_name}` 连接失败**\n\n请检查数据源配置是否正确。\n\n",
+                    "content": f"✅ 数据源 `{ds_name}` 连接成功\n\n",
+                    "role": "assistant",
+                    "type": "text",
+                }
+            except Exception as e:
+                yield {
+                    "content": f"❌ 数据源 `{ds_name}` 连接失败: {str(e)}\n\n",
                     "role": "assistant",
                     "type": "error",
                 }
                 return
 
-            yield {
-                "content": f"✅ 数据源 `{ds_name}` 连接成功！\n\n",
-                "role": "assistant",
-                "type": "text",
-            }
-
-        # 根据任务类型使用不同的工具流式执行
+        # 根据任务类型选择处理逻辑
         if task_type == TaskType.REVIEW:
             yield {
-                "content": "🔍 **开始SQL审查分析...**\n\n我将从以下几个方面进行分析：\n- SQL语法检查\n- 性能分析\n- 安全性检查\n- 最佳实践建议\n\n",
+                "content": "🔍 **开始SQL审查分析...**\n\n我将从性能、安全性和最佳实践等角度为你分析这个SQL语句。\n\n",
                 "role": "assistant",
                 "type": "text",
             }
@@ -175,6 +195,10 @@ async def process_sql_task(
             tool_params = {"sql": sql}
             if ds_name:
                 tool_params["ds_name"] = ds_name
+            if requirements:
+                tool_params["requirements"] = requirements
+            if user_id:
+                tool_params["user_id"] = user_id
 
             # 流式执行数据生成工具
             async for message in tool.execute_stream(**tool_params):
@@ -203,8 +227,133 @@ async def process_sql(request: SQLRequest):
     async def generate_chat_stream():
         """生成对话流式数据"""
         try:
+            # 处理不同任务类型的输入解析
+            sql = request.sql
+            requirements = ""
+
+            # 造数任务：必须使用mixed_input进行解析
+            if request.task_type == TaskType.DATA_GENERATION:
+                if not request.mixed_input:
+                    error_chunk = {
+                        "id": f"chatcmpl-error-{hash('missing_mixed_input')}",
+                        "object": "chat.completion.chunk",
+                        "created": int(asyncio.get_event_loop().time()),
+                        "model": "sql-expert",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": "❌ **错误**: 数据生成任务需要提供 mixed_input 字段\n\n",
+                                    "role": "assistant",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "error": True,
+                        "usage": None,
+                    }
+                    yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                try:
+                    text_parser = get_text_parser()
+                    parsed_result = await text_parser.parse_mixed_input(
+                        request.mixed_input
+                    )
+
+                    # 使用解析结果
+                    sql = parsed_result.sql
+                    requirements = parsed_result.requirements
+
+                    # 显示解析结果
+                    parse_chunk = {
+                        "id": f"chatcmpl-parse-{hash(str(parsed_result))}",
+                        "object": "chat.completion.chunk",
+                        "created": int(asyncio.get_event_loop().time()),
+                        "model": "sql-expert",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": f"📝 **文本解析结果** (置信度: {parsed_result.confidence:.2f})\n\n",
+                                    "role": "assistant",
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                        "usage": None,
+                    }
+                    yield f"data: {json.dumps(parse_chunk, ensure_ascii=False)}\n\n"
+
+                    if parsed_result.requirements:
+                        req_chunk = {
+                            "id": f"chatcmpl-req-{hash(parsed_result.requirements)}",
+                            "object": "chat.completion.chunk",
+                            "created": int(asyncio.get_event_loop().time()),
+                            "model": "sql-expert",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": f"🎯 **提取的用户要求**: {parsed_result.requirements}\n\n",
+                                        "role": "assistant",
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                            "usage": None,
+                        }
+                        yield f"data: {json.dumps(req_chunk, ensure_ascii=False)}\n\n"
+
+                    sql_chunk = {
+                        "id": f"chatcmpl-sql-{hash(sql)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(asyncio.get_event_loop().time()),
+                        "model": "sql-expert",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": f"💻 **提取的SQL语句**:\n```sql\n{sql}\n```\n\n",
+                                    "role": "assistant",
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                        "usage": None,
+                    }
+                    yield f"data: {json.dumps(sql_chunk, ensure_ascii=False)}\n\n"
+
+                except Exception as e:
+                    logger.error(f"文本解析失败: {str(e)}")
+                    error_chunk = {
+                        "id": f"chatcmpl-parse-error-{hash(str(e))}",
+                        "object": "chat.completion.chunk",
+                        "created": int(asyncio.get_event_loop().time()),
+                        "model": "sql-expert",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": f"⚠️ **文本解析失败，使用原始输入**: {str(e)}\n\n",
+                                    "role": "assistant",
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                        "usage": None,
+                    }
+                    yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                    sql = request.mixed_input  # 降级处理
+
+            # SQL Review任务：使用sql字段
+            else:
+                sql = request.sql
+                requirements = ""
+
             async for message in process_sql_task(
-                request.task_type, request.sql, request.ds_name
+                request.task_type, sql, request.ds_name, requirements, request.user_id
             ):
                 # 使用类似OpenAI ChatGPT的流式格式
                 chunk = {
@@ -276,55 +425,6 @@ async def process_sql(request: SQLRequest):
         media_type="text/event-stream",
         headers=stream_headers,
     )
-
-
-@router.post("/process_sync")
-async def process_sql_sync(request: SQLRequest):
-    """处理 SQL 请求的同步接口。
-
-    Args:
-        request: SQL请求对象
-
-    Returns:
-        SQLResponse: SQL响应对象
-    """
-    try:
-        # 检查数据源连接
-        if request.ds_name:
-            connection_ok = await datasource_manager.test_connection(request.ds_name)
-            if not connection_ok:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"数据源 '{request.ds_name}' 连接失败",
-                    headers=get_cors_headers(),
-                )
-
-        # 初始化 SQLAgent 实例
-        agent = SQLAgent()
-
-        # 根据任务类型构建提示词
-        if request.task_type == TaskType.REVIEW:
-            if request.ds_name:
-                prompt = f"请帮我 REVIEW 以下在数据源 '{request.ds_name}' 中的 SQL：\n{request.sql}"
-            else:
-                prompt = f"请帮我 REVIEW 以下 SQL：\n{request.sql}"
-        else:
-            if request.ds_name:
-                prompt = f"请帮我基于以下在数据源 '{request.ds_name}' 中的 SQL 进行造数：\n{request.sql}"
-            else:
-                prompt = f"请帮我基于以下 SQL 进行造数：\n{request.sql}"
-
-        # 调用 SQLAgent 处理任务
-        result = await agent.run(prompt)
-
-        return SQLResponse(
-            status="success",
-            message="处理完成",
-            data={"result": result, "datasource": request.ds_name or "default"},
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e), headers=get_cors_headers())
 
 
 @router.get("/datasources", response_model=DataSourceResponse)

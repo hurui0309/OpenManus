@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.datasource_config import router as datasource_config_router
+from app.api.favorite import router as favorite_router
 from app.api.sql_service import router as sql_router
 from app.api.user import router as user_router
 
@@ -36,6 +37,7 @@ app.add_middleware(
 app.include_router(sql_router)
 app.include_router(datasource_config_router)
 app.include_router(user_router)
+app.include_router(favorite_router)
 
 if __name__ == "__main__":
     import uvicorn

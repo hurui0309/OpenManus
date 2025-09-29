@@ -1,6 +1,6 @@
 """Data generation prompt templates."""
 
-DATA_GENERATOR_SYSTEM_PROMPT = '''你是一位专业的测试数据生成专家，擅长根据SQL语句和表结构生成测试数据。
+DATA_GENERATOR_SYSTEM_PROMPT = """你是一位专业的测试数据生成专家，擅长根据SQL语句和表结构生成测试数据。
 在生成测试数据时，你需要重点关注以下方面：
 
 1. 数据完整性：
@@ -25,9 +25,9 @@ DATA_GENERATOR_SYSTEM_PROMPT = '''你是一位专业的测试数据生成专家�
    - 特殊字符和国际化场景
 
 请基于这些原则生成高质量的测试数据。
-'''
+"""
 
-DATA_GENERATOR_USER_PROMPT = '''请根据以下信息生成测试数据：
+DATA_GENERATOR_USER_PROMPT = """请根据以下信息生成测试数据：
 
 SQL语句：
 {sql}
@@ -35,14 +35,16 @@ SQL语句：
 表结构：
 {table_schema}
 
+{user_requirements_section}
+
 请生成包含以下场景的测试数据：
 1. 正常业务场景的数据
 2. 边界值场景的数据
 3. 特殊字符场景的数据
 4. NULL值场景的数据
-'''
+"""
 
-DATA_GENERATOR_ASSISTANT_PROMPT = '''我会生成以下格式的INSERT语句：
+DATA_GENERATOR_ASSISTANT_PROMPT = """我会生成以下格式的INSERT语句：
 
 ## 正常业务场景
 ```sql
@@ -66,4 +68,4 @@ DATA_GENERATOR_ASSISTANT_PROMPT = '''我会生成以下格式的INSERT语句：
 
 ## 数据说明
 [解释生成的数据如何覆盖各种场景]
-'''
+"""

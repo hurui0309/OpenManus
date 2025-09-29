@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import lru_cache
@@ -18,7 +19,7 @@ except ImportError:
     # SQLAlchemy 1.4
     from sqlalchemy.inspection import inspect
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.config import Config
 from app.datasource import DataSourceManager
@@ -38,13 +39,20 @@ class DataGeneratorTool(BaseTool):
     """数据生成工具类，用于根据SQL生成测试数据。"""
 
     name: str = "data_generator"
-    description: str = "Generates test data based on SQL queries and table structure"
+    description: str = (
+        "Generates test data based on SQL queries, table structure and user requirements"
+    )
     parameters: Dict = {
         "type": "object",
         "properties": {
             "sql": {
                 "type": "string",
                 "description": "The SQL query to analyze for data generation",
+            },
+            "requirements": {
+                "type": "string",
+                "description": "User's specific requirements for test data generation (optional)",
+                "default": "",
             },
             "ds_name": {
                 "type": "string",
@@ -169,30 +177,61 @@ class DataGeneratorTool(BaseTool):
             logger.debug(f"解析或设置Hive队列失败: {e}")
 
     def _ensure_log_table(self) -> None:
-        """确保数据生成日志表存在。"""
+        """确保数据生成日志表存在并具有正确的结构。"""
         try:
             # 检查表是否存在
             inspector = inspect(self.engine)
             tables = inspector.get_table_names()
 
             if "data_generation_logs" not in tables:
-                # 使用事务创建日志表
+                # 创建新的日志表
                 with self.engine.begin() as conn:
-                    # 创建日志表
                     create_table_sql = """
                     CREATE TABLE data_generation_logs (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         sql_text TEXT NOT NULL,
+                        user_requirements TEXT,
+                        user_id VARCHAR(64),
                         ds_name VARCHAR(32),
                         generated_sql LONGTEXT,
                         execution_status VARCHAR(20) DEFAULT 'pending',
                         error_message TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_user_id (user_id),
+                        INDEX idx_created_at (created_at)
                     )
                     """
                     conn.execute(text(create_table_sql))
-                    # begin() 上下文管理器会自动提交
                 logger.info("数据生成日志表创建成功")
+            else:
+                # 检查表是否有必要的字段，如果没有则添加
+                try:
+                    columns = inspector.get_columns("data_generation_logs")
+                    column_names = [col["name"] for col in columns]
+
+                    # 检查并添加user_requirements字段
+                    if "user_requirements" not in column_names:
+                        with self.engine.begin() as conn:
+                            alter_sql = """
+                            ALTER TABLE data_generation_logs
+                            ADD COLUMN user_requirements TEXT AFTER sql_text
+                            """
+                            conn.execute(text(alter_sql))
+                        logger.info("数据生成日志表添加user_requirements字段成功")
+
+                    # 检查并添加user_id字段
+                    if "user_id" not in column_names:
+                        with self.engine.begin() as conn:
+                            alter_sql = """
+                            ALTER TABLE data_generation_logs
+                            ADD COLUMN user_id VARCHAR(64) AFTER user_requirements,
+                            ADD INDEX idx_user_id (user_id)
+                            """
+                            conn.execute(text(alter_sql))
+                        logger.info("数据生成日志表添加user_id字段成功")
+
+                except Exception as e:
+                    logger.warning(f"检查或添加字段失败: {str(e)}")
 
         except SQLAlchemyError as e:
             logger.error(f"创建日志表失败: {str(e)}")
@@ -206,6 +245,8 @@ class DataGeneratorTool(BaseTool):
         generated_sql: str,
         status: str,
         error_message: Optional[str] = None,
+        user_requirements: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> None:
         """记录数据生成操作。"""
         try:
@@ -215,12 +256,14 @@ class DataGeneratorTool(BaseTool):
                     text(
                         """
                     INSERT INTO data_generation_logs
-                    (sql_text, ds_name, generated_sql, execution_status, error_message)
-                    VALUES (:sql_text, :ds_name, :generated_sql, :status, :error_message)
+                    (sql_text, user_requirements, user_id, ds_name, generated_sql, execution_status, error_message)
+                    VALUES (:sql_text, :user_requirements, :user_id, :ds_name, :generated_sql, :status, :error_message)
                     """
                     ),
                     {
                         "sql_text": sql_text,
+                        "user_requirements": user_requirements,
+                        "user_id": user_id,
                         "ds_name": ds_name,
                         "generated_sql": generated_sql,
                         "status": status,
@@ -402,37 +445,111 @@ class DataGeneratorTool(BaseTool):
             raise DatabaseError(f"获取Hive表结构失败: {str(e)}")
 
     def extract_table_names(self, sql: str) -> List[str]:
-        """从SQL语句中提取表名。"""
-        # 简单而健壮的正则提取：支持 db.table 与单表、反引号包裹标识符
-        import re
+        """从SQL语句中提取表名，支持库.表格式和各种SQL语法。"""
 
-        # 支持的前缀关键字
-        prefixes = ["FROM", "JOIN", "INTO", "UPDATE"]
-        # 形如：FROM db.table 或 FROM table（均可带反引号）
-        ident = r"[`a-zA-Z_][`a-zA-Z0-9_]*"
-        pattern_tpl = rf"\b{{kw}}\s+({ident}(?:\s*\.\s*{ident})?)"
+        # 预处理SQL：处理MyBatis语法
+        if self._detect_mybatis_syntax(sql):
+            sql = self._normalize_mybatis_sql(sql)
+
+        # 更全面的关键字支持
+        prefixes = [
+            "FROM",
+            "JOIN",
+            "INTO",
+            "UPDATE",
+            r"INSERT\s+INTO",
+            r"REPLACE\s+INTO",
+            r"LEFT\s+JOIN",
+            r"RIGHT\s+JOIN",
+            r"INNER\s+JOIN",
+            r"OUTER\s+JOIN",
+            r"FULL\s+JOIN",
+            r"CROSS\s+JOIN",
+        ]
+
+        # 增强的标识符模式：支持数字开头、中文、下划线等
+        # 支持反引号、双引号、方括号包围的标识符
+        ident = r"(?:[`\"\[]?[a-zA-Z_\u4e00-\u9fa5][a-zA-Z0-9_\u4e00-\u9fa5]*[`\"\]]?)"
+
+        # 支持多层级的表名: db.schema.table 或 db.table
+        table_pattern = rf"({ident}(?:\s*\.\s*{ident})*)"
 
         seen = set()
         result: List[str] = []
+
         for kw in prefixes:
-            pattern = pattern_tpl.format(kw=kw)
+            # 构建完整的匹配模式
+            pattern = rf"\b{kw}\s+{table_pattern}(?:\s+(?:AS\s+)?{ident})?"
+
             for m in re.finditer(pattern, sql, re.IGNORECASE):
                 token = m.group(1).strip()
-                # 规范化：去除多余空格并移除反引号，保留 db.table 结构
-                token = token.replace(" ", "")
-                if "." in token:
-                    db, tbl = token.split(".", 1)
-                    db = db.strip("`")
-                    tbl = tbl.strip("`")
-                    normalized = f"{db}.{tbl}"
-                else:
-                    normalized = token.strip("`")
-                key = normalized.lower()
-                if key not in seen:
-                    seen.add(key)
-                    result.append(normalized)
+
+                # 规范化表名
+                normalized = self._normalize_table_name(token)
+                if normalized:
+                    key = normalized.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(normalized)
+
+        # 特殊处理：REPLACE INTO, INSERT INTO 等可能的变体
+        special_patterns = [
+            r"\b(?:INSERT|REPLACE)\s+INTO\s+([^(\s]+)",
+            r"\bUPDATE\s+([^(\s]+)\s+SET",
+            r"\bDELETE\s+FROM\s+([^(\s]+)",
+        ]
+
+        for pattern in special_patterns:
+            for m in re.finditer(pattern, sql, re.IGNORECASE):
+                token = m.group(1).strip()
+                normalized = self._normalize_table_name(token)
+                if normalized:
+                    key = normalized.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(normalized)
 
         return result
+
+    def _normalize_table_name(self, table_name: str) -> str:
+        """规范化表名，处理引号、空格等。
+
+        Args:
+            table_name: 原始表名
+
+        Returns:
+            str: 规范化后的表名
+        """
+        if not table_name:
+            return ""
+
+        # 移除各种引号和空格
+        table_name = table_name.strip()
+        table_name = re.sub(r"\s+", "", table_name)  # 移除所有空白
+
+        # 移除包围的引号/反引号/方括号
+        quote_patterns = [r"^`(.+)`$", r'^"(.+)"$', r"^\[(.+)\]$"]
+        for pattern in quote_patterns:
+            match = re.match(pattern, table_name)
+            if match:
+                table_name = match.group(1)
+                break
+
+        # 处理库.表格式，分别处理每个部分的引号
+        if "." in table_name:
+            parts = table_name.split(".")
+            normalized_parts = []
+            for part in parts:
+                # 移除每个部分的引号
+                for pattern in quote_patterns:
+                    match = re.match(pattern, part)
+                    if match:
+                        part = match.group(1)
+                        break
+                normalized_parts.append(part)
+            table_name = ".".join(normalized_parts)
+
+        return table_name
 
     def _parse_generated_sql(self, response: str) -> Tuple[str, str]:
         """解析LLM生成的响应，提取SQL语句。
@@ -694,8 +811,6 @@ class DataGeneratorTool(BaseTool):
             str: 提取到的SQL语句，如果没有则返回空字符串
         """
         try:
-            import re
-
             # 常见的SQL关键词
             sql_keywords = [
                 "INSERT",
@@ -737,8 +852,6 @@ class DataGeneratorTool(BaseTool):
             str: 修复后的文本
         """
         try:
-            import re
-
             fixed_text = text
 
             # 1. 检查并修复未闭合的SQL代码块
@@ -841,8 +954,6 @@ class DataGeneratorTool(BaseTool):
             error_parts.append("❌ 未发现```sql代码块")
             # 检查是否有其他类型的代码块
             if "```" in response:
-                import re
-
                 code_blocks = re.findall(r"```(\w*)", response)
                 if code_blocks:
                     error_parts.append(f"发现其他代码块: {', '.join(set(code_blocks))}")
@@ -883,8 +994,6 @@ class DataGeneratorTool(BaseTool):
         Returns:
             str: 清理后的SQL语句
         """
-        import re
-
         # 基本清理
         cleaned_sql = sql.strip()
 
@@ -908,8 +1017,6 @@ class DataGeneratorTool(BaseTool):
         Returns:
             List[str]: 分割后的SQL语句列表
         """
-        import re
-
         # 先清理注释
         cleaned_sql = self._clean_sql_for_hive_execution(sql)
 
@@ -1014,77 +1121,177 @@ class DataGeneratorTool(BaseTool):
 
                 # 执行每条SQL语句
                 for i, stmt in enumerate(statements, 1):
-                    try:
-                        # 清理单个语句
-                        if ds_type == "hive":
-                            stmt = self._clean_sql_for_hive_execution(stmt)
+                    max_retries = 2  # 最大重试次数
+                    retry_count = 0
+                    statement_success = False
+                    current_stmt = stmt
 
-                        logger.info(f"执行第 {i}/{len(statements)} 条SQL语句")
-                        logger.debug(f"SQL: {stmt[:200]}...")
+                    while retry_count <= max_retries and not statement_success:
+                        try:
+                            # 清理单个语句
+                            if ds_type == "hive":
+                                current_stmt = self._clean_sql_for_hive_execution(
+                                    current_stmt
+                                )
 
-                        # 预估影响行数（用于INSERT VALUES语句）
-                        estimated_rows = self._estimate_affected_rows(stmt)
+                            if retry_count == 0:
+                                logger.info(f"执行第 {i}/{len(statements)} 条SQL语句")
+                            else:
+                                logger.info(
+                                    f"重试第 {i} 条SQL语句 (第 {retry_count} 次重试)"
+                                )
 
-                        # 提取影响的表名
-                        affected_table = self._extract_table_from_statement(stmt)
+                            logger.debug(f"SQL: {current_stmt[:200]}...")
 
-                        # 执行SQL语句
-                        result = conn.execute(text(stmt))
+                            # 预估影响行数（用于INSERT VALUES语句）
+                            estimated_rows = self._estimate_affected_rows(current_stmt)
 
-                        # 获取实际影响的行数
-                        actual_rows = getattr(result, "rowcount", estimated_rows)
+                            # 提取影响的表名
+                            affected_table = self._extract_table_from_statement(
+                                current_stmt
+                            )
 
-                        # 如果数据库不返回rowcount，使用预估值
-                        if actual_rows == -1 or actual_rows is None:
-                            actual_rows = estimated_rows
+                            # 执行SQL语句
+                            result = conn.execute(text(current_stmt))
 
-                        # 更新统计信息
-                        execution_results["successful_statements"] += 1
-                        execution_results["total_rows_affected"] += actual_rows
+                            # 获取实际影响的行数
+                            actual_rows = getattr(result, "rowcount", estimated_rows)
 
-                        if affected_table:
-                            execution_results["affected_tables"].add(affected_table)
+                            # 如果数据库不返回rowcount，使用预估值
+                            if actual_rows == -1 or actual_rows is None:
+                                actual_rows = estimated_rows
 
-                        # 记录单条语句详情
-                        execution_results["statement_details"].append(
-                            {
+                            # 更新统计信息
+                            execution_results["successful_statements"] += 1
+                            execution_results["total_rows_affected"] += actual_rows
+
+                            if affected_table:
+                                execution_results["affected_tables"].add(affected_table)
+
+                            # 记录单条语句详情
+                            success_detail = {
                                 "statement_index": i,
                                 "sql_preview": (
-                                    stmt[:100] + "..." if len(stmt) > 100 else stmt
+                                    current_stmt[:100] + "..."
+                                    if len(current_stmt) > 100
+                                    else current_stmt
                                 ),
                                 "affected_table": affected_table,
                                 "rows_affected": actual_rows,
                                 "status": "success",
                             }
-                        )
 
-                        logger.info(f"SQL语句 {i} 执行成功，影响 {actual_rows} 行")
+                            if retry_count > 0:
+                                success_detail["retry_count"] = retry_count
+                                success_detail["recovery_applied"] = True
 
-                    except SQLAlchemyError as e:
-                        logger.error(
-                            f"Failed to execute SQL statement {i}: {stmt[:100]}..."
-                        )
-                        logger.error(f"Error: {str(e)}")
+                            execution_results["statement_details"].append(
+                                success_detail
+                            )
 
-                        # 记录失败的语句
-                        execution_results["statement_details"].append(
-                            {
+                            logger.info(
+                                f"SQL语句 {i} 执行成功，影响 {actual_rows} 行"
+                                + (
+                                    f" (经过 {retry_count} 次重试)"
+                                    if retry_count > 0
+                                    else ""
+                                )
+                            )
+                            statement_success = True
+
+                        except SQLAlchemyError as e:
+                            retry_count += 1
+                            logger.error(
+                                f"SQL语句 {i} 执行失败 (尝试 {retry_count}/{max_retries + 1}): {str(e)}"
+                            )
+
+                            # 分析错误类型
+                            error_analysis = self._analyze_constraint_error(
+                                e, current_stmt
+                            )
+                            logger.info(
+                                f"错误分析结果: {error_analysis['error_type']} - {error_analysis['suggestion']}"
+                            )
+
+                            # 尝试错误恢复
+                            if retry_count <= max_retries and error_analysis.get(
+                                "can_retry", False
+                            ):
+                                try:
+                                    # 获取表结构信息用于修复
+                                    affected_table = self._extract_table_from_statement(
+                                        current_stmt
+                                    )
+                                    if affected_table:
+                                        table_schema = (
+                                            await self._get_table_schema_for_recovery(
+                                                affected_table, ds_name
+                                            )
+                                        )
+                                        fixed_sql = await self._attempt_error_recovery(
+                                            current_stmt,
+                                            error_analysis,
+                                            table_schema,
+                                            ds_name,
+                                        )
+
+                                        if fixed_sql:
+                                            logger.info(f"生成修复SQL，准备重试...")
+                                            current_stmt = fixed_sql
+                                            continue
+                                        else:
+                                            logger.warning(
+                                                "无法生成修复SQL，将记录错误并继续"
+                                            )
+                                    else:
+                                        logger.warning("无法提取表名，跳过错误恢复")
+                                except Exception as recovery_error:
+                                    logger.error(
+                                        f"错误恢复过程中出现异常: {recovery_error}"
+                                    )
+
+                            # 记录失败的语句
+                            error_detail = {
                                 "statement_index": i,
                                 "sql_preview": (
-                                    stmt[:100] + "..." if len(stmt) > 100 else stmt
+                                    current_stmt[:100] + "..."
+                                    if len(current_stmt) > 100
+                                    else current_stmt
                                 ),
                                 "affected_table": self._extract_table_from_statement(
-                                    stmt
+                                    current_stmt
                                 ),
                                 "rows_affected": 0,
                                 "status": "failed",
                                 "error": str(e),
+                                "error_analysis": error_analysis,
+                                "retry_count": retry_count - 1,
                             }
-                        )
 
-                        raise DatabaseError(
-                            f"Failed to execute SQL statement {i}: {str(e)}\nSQL: {stmt[:200]}..."
-                        )
+                            # 如果是最后一次尝试，记录失败详情
+                            if retry_count > max_retries:
+                                execution_results["statement_details"].append(
+                                    error_detail
+                                )
+
+                                # 根据错误类型决定是否继续执行
+                                if error_analysis.get("error_type") in [
+                                    "foreign_key_constraint"
+                                ]:
+                                    logger.error(
+                                        f"遇到严重约束错误，停止执行: {str(e)}"
+                                    )
+                                    raise DatabaseError(
+                                        f"Failed to execute SQL statement {i}: {str(e)}\n"
+                                        f"错误类型: {error_analysis.get('error_type', 'unknown')}\n"
+                                        f"建议: {error_analysis.get('suggestion', '请检查数据约束')}\n"
+                                        f"SQL: {current_stmt[:200]}..."
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"SQL语句 {i} 执行失败，但将继续执行后续语句"
+                                    )
+                                    break  # 跳出重试循环，继续下一条语句
 
             # 转换set为list用于JSON序列化
             execution_results["affected_tables"] = list(
@@ -1105,13 +1312,15 @@ class DataGeneratorTool(BaseTool):
         """执行数据生成任务的流式版本。
 
         Args:
-            **kwargs: 包含sql和ds_name参数
+            **kwargs: 包含sql、requirements、ds_name和user_id参数
 
         Yields:
             dict: 流式消息内容
         """
         sql = kwargs.get("sql")
+        requirements = kwargs.get("requirements", "")
         ds_name = kwargs.get("ds_name")
+        user_id = kwargs.get("user_id")
 
         if not sql:
             yield {
@@ -1128,6 +1337,29 @@ class DataGeneratorTool(BaseTool):
                 "role": "assistant",
                 "type": "text",
             }
+
+            # 检测并处理MyBatis语法
+            original_sql = sql
+            if self._detect_mybatis_syntax(sql):
+                yield {
+                    "content": "🔧 **检测到MyBatis语法，正在标准化...**\n\n",
+                    "role": "assistant",
+                    "type": "text",
+                }
+                sql = self._normalize_mybatis_sql(sql)
+                yield {
+                    "content": f"✅ **MyBatis语法标准化完成**\n\n原始SQL包含MyBatis动态语法，已转换为标准SQL格式。\n\n",
+                    "role": "assistant",
+                    "type": "text",
+                }
+
+            # 如果有用户要求，显示给用户
+            if requirements and requirements.strip():
+                yield {
+                    "content": f"📋 **用户要求**: {requirements}\n\n",
+                    "role": "assistant",
+                    "type": "text",
+                }
 
             # 提取表名
             table_names = self.extract_table_names(sql)
@@ -1220,10 +1452,17 @@ class DataGeneratorTool(BaseTool):
                 """
 
             # 🚀 构建简化的提示词 - 针对截断问题优化
-            prompt = f"""基于以下信息生成测试数据SQL：
+            # 构建用户要求部分
+            user_requirements_section = ""
+            if requirements and requirements.strip():
+                user_requirements_section = f"""用户特殊要求：
+{requirements.strip()}
 
-原SQL: {sql}
-数据源: {ds_name or 'default'} ({ds_type})
+请在生成测试数据时，特别关注并满足上述用户要求。"""
+
+            prompt = DATA_GENERATOR_USER_PROMPT.format(
+                sql=sql,
+                table_schema=f"""数据源: {ds_name or 'default'} ({ds_type})
 
 表结构:
 {schema_info}
@@ -1235,14 +1474,9 @@ class DataGeneratorTool(BaseTool):
 2. 遵循数据库约束
 3. 使用建议的起始ID
 4. 使用简洁的中文值（如：'用户1'、'测试数据'）
-5. 返回完整的SQL代码块
-
-格式要求：
-```sql
--- 您的SQL语句
-```
-
-请直接生成INSERT语句："""
+""",
+                user_requirements_section=user_requirements_section,
+            )
 
             # 🚀 开始流式调用LLM (简化版)
             yield {
@@ -1254,7 +1488,11 @@ class DataGeneratorTool(BaseTool):
             # 流式调用LLM并实时输出
             full_response = ""
             async for chunk in self.llm.ask_stream(
-                [{"role": "user", "content": prompt}]
+                [
+                    {"role": "system", "content": DATA_GENERATOR_SYSTEM_PROMPT},
+                    {"role": "assistant", "content": DATA_GENERATOR_ASSISTANT_PROMPT},
+                    {"role": "user", "content": prompt},
+                ]
             ):
                 if chunk:
                     full_response += chunk
@@ -1297,7 +1535,9 @@ class DataGeneratorTool(BaseTool):
                 detailed_error_msg += "3. 如果问题持续，请联系技术支持\n\n"
 
                 # 记录详细的错误日志
-                self._log_generation(sql, ds_name, "", "failed", error_detail)
+                self._log_generation(
+                    sql, ds_name, "", "failed", error_detail, requirements, user_id
+                )
                 logger.error(f"SQL解析失败详情: {error_detail}")
                 logger.debug(f"完整LLM响应: {full_response}")
 
@@ -1324,7 +1564,9 @@ class DataGeneratorTool(BaseTool):
             )
 
             # 记录成功日志
-            self._log_generation(sql, ds_name, validated_sql, "success")
+            self._log_generation(
+                sql, ds_name, validated_sql, "success", None, requirements, user_id
+            )
 
             # 清理缓存中的next_id（避免重复使用相同ID）
             self._next_id_cache.clear()
@@ -1349,15 +1591,57 @@ class DataGeneratorTool(BaseTool):
             used_sql = locals().get("validated_sql") or locals().get(
                 "generated_sql", ""
             )
-            self._log_generation(sql, ds_name, used_sql, "failed", error_msg)
+            self._log_generation(
+                sql, ds_name, used_sql, "failed", error_msg, requirements, user_id
+            )
 
-            # 简化错误处理
+            # 增强错误处理，分析错误类型
             detailed_error = f"❌ **数据生成失败**: {error_msg}\n\n"
 
-            if "duplicate" in error_msg.lower():
-                detailed_error += "💡 建议: 主键冲突，请重试\n\n"
-            elif "null" in error_msg.lower():
-                detailed_error += "💡 建议: NOT NULL约束违反\n\n"
+            # 尝试分析错误类型并提供建议
+            if used_sql:
+                try:
+                    from sqlalchemy.exc import IntegrityError
+
+                    # 创建一个临时的SQLAlchemy错误对象进行分析
+                    temp_error = IntegrityError("", "", error_msg)
+                    error_analysis = self._analyze_constraint_error(
+                        temp_error, used_sql
+                    )
+
+                    detailed_error += f"🔍 **错误分析**:\n"
+                    detailed_error += (
+                        f"- 错误类型: {error_analysis.get('constraint_type', '未知')}\n"
+                    )
+                    if error_analysis.get("column_name"):
+                        detailed_error += f"- 相关列: {error_analysis['column_name']}\n"
+                    if error_analysis.get("table_name"):
+                        detailed_error += f"- 相关表: {error_analysis['table_name']}\n"
+                    detailed_error += f"- 建议: {error_analysis.get('suggestion', '请检查数据约束')}\n\n"
+
+                    if error_analysis.get("can_retry", False):
+                        detailed_error += (
+                            "🔄 **自动重试**: 系统已尝试自动修复此问题\n\n"
+                        )
+
+                except Exception as analysis_error:
+                    logger.warning(f"错误分析失败: {analysis_error}")
+                    # 回退到简单的错误类型检测
+                    if (
+                        "duplicate" in error_msg.lower()
+                        or "unique" in error_msg.lower()
+                    ):
+                        detailed_error += (
+                            "💡 **建议**: 主键或唯一约束冲突，请尝试生成不同的数据\n\n"
+                        )
+                    elif "null" in error_msg.lower():
+                        detailed_error += "💡 **建议**: NOT NULL约束违反，请确保所有必填字段都有值\n\n"
+                    elif "foreign key" in error_msg.lower():
+                        detailed_error += (
+                            "💡 **建议**: 外键约束违反，请确保引用的值在父表中存在\n\n"
+                        )
+                    else:
+                        detailed_error += "💡 **建议**: 请检查数据约束和表结构定义\n\n"
 
             yield {
                 "content": detailed_error,
@@ -1378,12 +1662,13 @@ class DataGeneratorTool(BaseTool):
         """执行数据生成任务。
 
         Args:
-            **kwargs: 包含sql和ds_name参数
+            **kwargs: 包含sql、requirements和ds_name参数
 
         Returns:
             ToolResult: 工具执行结果
         """
         sql = kwargs.get("sql")
+        requirements = kwargs.get("requirements", "")
         ds_name = kwargs.get("ds_name")
 
         if not sql:
@@ -1436,10 +1721,17 @@ class DataGeneratorTool(BaseTool):
                 """
 
             # 🚀 构建简化的提示词 - 针对截断问题优化
-            prompt = f"""基于以下信息生成测试数据SQL：
+            # 构建用户要求部分
+            user_requirements_section = ""
+            if requirements and requirements.strip():
+                user_requirements_section = f"""用户特殊要求：
+{requirements.strip()}
 
-原SQL: {sql}
-数据源: {ds_name or 'default'} ({ds_type})
+请在生成测试数据时，特别关注并满足上述用户要求。"""
+
+            prompt = DATA_GENERATOR_USER_PROMPT.format(
+                sql=sql,
+                table_schema=f"""数据源: {ds_name or 'default'} ({ds_type})
 
 表结构:
 {schema_info}
@@ -1451,17 +1743,18 @@ class DataGeneratorTool(BaseTool):
 2. 遵循数据库约束
 3. 使用建议的起始ID
 4. 使用简洁的中文值（如：'用户1'、'测试数据'）
-5. 返回完整的SQL代码块
-
-格式要求：
-```sql
--- 您的SQL语句
-```
-
-请直接生成INSERT语句："""
+""",
+                user_requirements_section=user_requirements_section,
+            )
 
             # 调用LLM生成SQL
-            response = await self.llm.ask([{"role": "user", "content": prompt}])
+            response = await self.llm.ask(
+                [
+                    {"role": "system", "content": DATA_GENERATOR_SYSTEM_PROMPT},
+                    {"role": "assistant", "content": DATA_GENERATOR_ASSISTANT_PROMPT},
+                    {"role": "user", "content": prompt},
+                ]
+            )
 
             # 🚀 新增：修复响应的markdown格式
             response = self._fix_markdown_format(response)
@@ -1474,7 +1767,9 @@ class DataGeneratorTool(BaseTool):
                 detailed_error_msg = f"SQL解析失败: {error_detail}"
 
                 # 记录详细的错误日志
-                self._log_generation(sql, ds_name, "", "failed", error_detail)
+                self._log_generation(
+                    sql, ds_name, "", "failed", error_detail, requirements, user_id
+                )
                 logger.error(f"SQL解析失败详情: {error_detail}")
                 logger.debug(f"完整LLM响应: {response}")
 
@@ -1489,7 +1784,9 @@ class DataGeneratorTool(BaseTool):
             )
 
             # 记录成功日志
-            self._log_generation(sql, ds_name, validated_sql, "success")
+            self._log_generation(
+                sql, ds_name, validated_sql, "success", None, requirements, user_id
+            )
 
             # 清理缓存中的next_id（避免重复使用相同ID）
             self._next_id_cache.clear()
@@ -1507,7 +1804,9 @@ class DataGeneratorTool(BaseTool):
             used_sql = locals().get("validated_sql") or locals().get(
                 "generated_sql", ""
             )
-            self._log_generation(sql, ds_name, used_sql, "failed", error_msg)
+            self._log_generation(
+                sql, ds_name, used_sql, "failed", error_msg, requirements, user_id
+            )
 
             # 简化错误处理
             detailed_error = f"数据生成失败: {error_msg}"
@@ -1522,7 +1821,9 @@ class DataGeneratorTool(BaseTool):
 
         except Exception as e:
             error_msg = f"Unexpected error: {str(e)}"
-            self._log_generation(sql, ds_name, "", "failed", error_msg)
+            self._log_generation(
+                sql, ds_name, "", "failed", error_msg, requirements, user_id
+            )
             logger.error(f"Unexpected error in data generation: {error_msg}")
             return ToolResult(error=error_msg)
 
@@ -1634,8 +1935,6 @@ class DataGeneratorTool(BaseTool):
         scale = None
 
         # 解析字段类型中的长度信息
-        import re
-
         # VARCHAR(255), CHAR(10) 等
         varchar_match = re.search(r"(VAR)?CHAR\((\d+)\)", col_type)
         if varchar_match:
@@ -1855,8 +2154,6 @@ class DataGeneratorTool(BaseTool):
             return stmt, warnings
 
         # 提取表名和分析INSERT语句
-        import re
-
         # 匹配 INSERT INTO 或 REPLACE INTO 语句
         insert_match = re.search(
             r"(INSERT|REPLACE)\s+INTO\s+(?:TABLE\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
@@ -1958,8 +2255,6 @@ class DataGeneratorTool(BaseTool):
         warnings = []
 
         try:
-            import re
-
             # 使用正则表达式更准确地解析 VALUES 子句
             # 匹配形如 (value1, value2, ...) 的模式
             pattern = r"\([^)]+\)"
@@ -2335,8 +2630,6 @@ class DataGeneratorTool(BaseTool):
             bool: 如果格式良好返回True，否则返回False
         """
         try:
-            import re
-
             # 去除首尾空白和换行符
             content = values_content.strip()
 
@@ -2729,8 +3022,6 @@ class DataGeneratorTool(BaseTool):
 
                     # 统计VALUES中的行数
                     # 简单方法：统计VALUES后面括号组的数量
-                    import re
-
                     # 匹配形如 (...), (...), ... 的模式
                     pattern = r"\([^)]*\)"
                     matches = re.findall(pattern, values_part)
@@ -2745,8 +3036,6 @@ class DataGeneratorTool(BaseTool):
                 values_start = sql_upper.find("VALUES")
                 if values_start != -1:
                     values_part = sql_statement[values_start + 6 :].strip()
-
-                    import re
 
                     pattern = r"\([^)]*\)"
                     matches = re.findall(pattern, values_part)
@@ -2774,8 +3063,6 @@ class DataGeneratorTool(BaseTool):
             Optional[str]: 提取的表名，如果无法提取则返回None
         """
         try:
-            import re
-
             sql_upper = sql_statement.upper().strip()
 
             # 匹配INSERT INTO table_name
@@ -2873,3 +3160,451 @@ class DataGeneratorTool(BaseTool):
             result_lines.append(f"\n🎉 测试数据已成功写入数据库。")
 
         return "\n".join(result_lines) + "\n\n"
+
+    def _analyze_constraint_error(
+        self, error: SQLAlchemyError, sql: str
+    ) -> Dict[str, Any]:
+        """分析数据库约束错误，提供诊断信息和修复建议。
+
+        Args:
+            error: SQLAlchemy错误对象
+            sql: 出错的SQL语句
+
+        Returns:
+            Dict[str, Any]: 错误分析结果
+        """
+        error_str = str(error).lower()
+        analysis = {
+            "error_type": "unknown",
+            "constraint_type": None,
+            "column_name": None,
+            "table_name": None,
+            "suggestion": "请检查数据约束",
+            "can_retry": False,
+            "fix_strategy": None,
+        }
+
+        try:
+            # 提取表名
+            table_match = re.search(r"into\s+(\w+)", sql.lower())
+            if table_match:
+                analysis["table_name"] = table_match.group(1)
+
+            # 分析NOT NULL约束错误
+            if "cannot be null" in error_str or "not null constraint" in error_str:
+                analysis["error_type"] = "not_null_constraint"
+                analysis["constraint_type"] = "NOT NULL"
+                analysis["can_retry"] = True
+                analysis["fix_strategy"] = "generate_non_null_values"
+
+                # 提取列名
+                null_column_match = re.search(r"column\s*'([^']+)'", error_str)
+                if null_column_match:
+                    analysis["column_name"] = null_column_match.group(1)
+                    analysis["suggestion"] = (
+                        f"列 '{analysis['column_name']}' 不能为空，需要生成有效的非空值"
+                    )
+                else:
+                    analysis["suggestion"] = (
+                        "存在NOT NULL约束违反，需要为所有必填列生成有效值"
+                    )
+
+            # 分析UNIQUE约束错误
+            elif "duplicate" in error_str or "unique constraint" in error_str:
+                analysis["error_type"] = "unique_constraint"
+                analysis["constraint_type"] = "UNIQUE"
+                analysis["can_retry"] = True
+                analysis["fix_strategy"] = "generate_unique_values"
+                analysis["suggestion"] = "存在唯一性约束违反，需要生成不重复的值"
+
+            # 分析外键约束错误
+            elif "foreign key constraint" in error_str or "foreign key" in error_str:
+                analysis["error_type"] = "foreign_key_constraint"
+                analysis["constraint_type"] = "FOREIGN KEY"
+                analysis["can_retry"] = False  # 外键错误通常需要人工处理
+                analysis["suggestion"] = "外键约束违反，请确保引用的值在父表中存在"
+
+            # 分析CHECK约束错误
+            elif "check constraint" in error_str:
+                analysis["error_type"] = "check_constraint"
+                analysis["constraint_type"] = "CHECK"
+                analysis["can_retry"] = True
+                analysis["fix_strategy"] = "generate_valid_values"
+                analysis["suggestion"] = "CHECK约束违反，需要生成符合约束条件的值"
+
+            # 分析数据类型错误
+            elif "data type" in error_str or "invalid" in error_str:
+                analysis["error_type"] = "data_type_error"
+                analysis["can_retry"] = True
+                analysis["fix_strategy"] = "fix_data_types"
+                analysis["suggestion"] = "数据类型不匹配，需要调整生成的数据格式"
+
+        except Exception as e:
+            logger.warning(f"分析错误信息时出现异常: {e}")
+
+        return analysis
+
+    async def _attempt_error_recovery(
+        self,
+        failed_sql: str,
+        error_analysis: Dict[str, Any],
+        table_schema: Dict[str, Any],
+        ds_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """尝试根据错误分析结果修复SQL语句。
+
+        Args:
+            failed_sql: 失败的SQL语句
+            error_analysis: 错误分析结果
+            table_schema: 表结构信息
+            ds_name: 数据源名称
+
+        Returns:
+            Optional[str]: 修复后的SQL语句，如果无法修复则返回None
+        """
+        if not error_analysis.get("can_retry", False):
+            return None
+
+        try:
+            fix_strategy = error_analysis.get("fix_strategy")
+
+            if fix_strategy == "generate_non_null_values":
+                return await self._fix_null_constraint_error(
+                    failed_sql, error_analysis, table_schema, ds_name
+                )
+            elif fix_strategy == "generate_unique_values":
+                return await self._fix_unique_constraint_error(
+                    failed_sql, error_analysis, table_schema, ds_name
+                )
+            elif fix_strategy == "generate_valid_values":
+                return await self._fix_check_constraint_error(
+                    failed_sql, error_analysis, table_schema, ds_name
+                )
+            elif fix_strategy == "fix_data_types":
+                return await self._fix_data_type_error(
+                    failed_sql, error_analysis, table_schema, ds_name
+                )
+
+        except Exception as e:
+            logger.error(f"错误恢复尝试失败: {e}")
+
+        return None
+
+    async def _fix_null_constraint_error(
+        self,
+        failed_sql: str,
+        error_analysis: Dict[str, Any],
+        table_schema: Dict[str, Any],
+        ds_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """修复NOT NULL约束错误。"""
+        try:
+            column_name = error_analysis.get("column_name")
+            if not column_name:
+                return None
+
+            # 找到对应的列信息
+            target_column = None
+            for col in table_schema.get("columns", []):
+                if col["name"].lower() == column_name.lower():
+                    target_column = col
+                    break
+
+            if not target_column:
+                return None
+
+            # 构建修复提示
+            fix_prompt = f"""
+原SQL语句执行失败，错误原因：列 '{column_name}' 不能为空。
+
+请修复以下SQL语句，确保为 '{column_name}' 列生成有效的非空值：
+- 列类型：{target_column.get('type', 'unknown')}
+- 列约束：{'NOT NULL' if not target_column.get('nullable', True) else ''}
+
+原SQL语句：
+{failed_sql}
+
+请生成修复后的SQL语句，确保：
+1. 所有NOT NULL列都有有效值
+2. 保持原有的数据生成逻辑
+3. 只返回修复后的SQL语句，不要包含解释
+
+修复后的SQL：
+"""
+
+            # 使用LLM修复SQL
+            response = await self.llm.ask([{"role": "user", "content": fix_prompt}])
+
+            # 提取修复后的SQL
+            fixed_sql = self._extract_sql_from_response(response)
+            return fixed_sql
+
+        except Exception as e:
+            logger.error(f"修复NOT NULL约束错误失败: {e}")
+            return None
+
+    async def _fix_unique_constraint_error(
+        self,
+        failed_sql: str,
+        error_analysis: Dict[str, Any],
+        table_schema: Dict[str, Any],
+        ds_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """修复UNIQUE约束错误。"""
+        try:
+            fix_prompt = f"""
+原SQL语句执行失败，错误原因：违反唯一性约束。
+
+请修复以下SQL语句，确保生成的数据不会违反唯一性约束：
+
+表结构信息：
+- 主键：{table_schema.get('primary_keys', [])}
+- 唯一约束：{table_schema.get('unique_constraints', [])}
+
+原SQL语句：
+{failed_sql}
+
+请生成修复后的SQL语句，确保：
+1. 为主键和唯一列生成不重复的值
+2. 可以使用时间戳、随机数等确保唯一性
+3. 保持原有的数据生成逻辑
+4. 只返回修复后的SQL语句
+
+修复后的SQL：
+"""
+
+            response = await self.llm.ask([{"role": "user", "content": fix_prompt}])
+            fixed_sql = self._extract_sql_from_response(response)
+            return fixed_sql
+
+        except Exception as e:
+            logger.error(f"修复UNIQUE约束错误失败: {e}")
+            return None
+
+    async def _fix_check_constraint_error(
+        self,
+        failed_sql: str,
+        error_analysis: Dict[str, Any],
+        table_schema: Dict[str, Any],
+        ds_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """修复CHECK约束错误。"""
+        try:
+            fix_prompt = f"""
+原SQL语句执行失败，错误原因：违反CHECK约束。
+
+请修复以下SQL语句，确保生成的数据符合所有CHECK约束：
+
+表结构信息：
+- CHECK约束：{table_schema.get('check_constraints', [])}
+
+原SQL语句：
+{failed_sql}
+
+请生成修复后的SQL语句，确保：
+1. 所有值都符合CHECK约束条件
+2. 保持原有的数据生成逻辑
+3. 只返回修复后的SQL语句
+
+修复后的SQL：
+"""
+
+            response = await self.llm.ask([{"role": "user", "content": fix_prompt}])
+            fixed_sql = self._extract_sql_from_response(response)
+            return fixed_sql
+
+        except Exception as e:
+            logger.error(f"修复CHECK约束错误失败: {e}")
+            return None
+
+    async def _fix_data_type_error(
+        self,
+        failed_sql: str,
+        error_analysis: Dict[str, Any],
+        table_schema: Dict[str, Any],
+        ds_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """修复数据类型错误。"""
+        try:
+            fix_prompt = f"""
+原SQL语句执行失败，错误原因：数据类型不匹配。
+
+请修复以下SQL语句，确保所有值的数据类型正确：
+
+表结构信息：
+{table_schema.get('columns', [])}
+
+原SQL语句：
+{failed_sql}
+
+请生成修复后的SQL语句，确保：
+1. 所有值的数据类型与列定义匹配
+2. 字符串值用引号包围
+3. 数值类型不用引号
+4. 日期时间格式正确
+5. 只返回修复后的SQL语句
+
+修复后的SQL：
+"""
+
+            response = await self.llm.ask([{"role": "user", "content": fix_prompt}])
+            fixed_sql = self._extract_sql_from_response(response)
+            return fixed_sql
+
+        except Exception as e:
+            logger.error(f"修复数据类型错误失败: {e}")
+            return None
+
+    def _extract_sql_from_response(self, response: str) -> str:
+        """从LLM响应中提取SQL语句。"""
+        # 移除markdown代码块标记
+        response = re.sub(r"```sql\s*", "", response, flags=re.IGNORECASE)
+        response = re.sub(r"```\s*", "", response)
+
+        # 移除多余的空白和注释
+        lines = response.strip().split("\n")
+        sql_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("--") and not line.startswith("#"):
+                sql_lines.append(line)
+
+        return "\n".join(sql_lines).strip()
+
+    async def _get_table_schema_for_recovery(
+        self, table_name: str, ds_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """获取表结构信息用于错误恢复。
+
+        Args:
+            table_name: 表名
+            ds_name: 数据源名称
+
+        Returns:
+            Dict[str, Any]: 表结构信息
+        """
+        try:
+            # 复用现有的表结构获取逻辑
+            ds_type = await self._get_datasource_type(ds_name)
+
+            if ds_type == "hive":
+                return await self._get_hive_table_schema(table_name, ds_name)
+            else:
+                return await self._get_mysql_table_schema(table_name, ds_name)
+
+        except Exception as e:
+            logger.warning(f"获取表结构信息失败: {e}")
+            # 返回基本的表结构信息
+            return {
+                "table_name": table_name,
+                "columns": [],
+                "primary_keys": [],
+                "foreign_keys": [],
+                "unique_constraints": [],
+                "check_constraints": [],
+                "datasource": ds_name or "default",
+            }
+
+    def _normalize_mybatis_sql(self, sql: str) -> str:
+        """标准化MyBatis格式的SQL，转换占位符为标准SQL。
+
+        Args:
+            sql: 包含MyBatis语法的SQL语句
+
+        Returns:
+            str: 标准化后的SQL语句
+        """
+        try:
+            # 移除XML注释
+            sql = re.sub(r"<!--.*?-->", "", sql, flags=re.DOTALL)
+
+            # 处理MyBatis动态SQL标签，提取其中的SQL
+            # 简单处理<if>, <where>, <set>, <foreach>等标签
+            sql = re.sub(
+                r"<if[^>]*>(.*?)</if>", r"\1", sql, flags=re.DOTALL | re.IGNORECASE
+            )
+            sql = re.sub(
+                r"<where[^>]*>(.*?)</where>",
+                r"WHERE \1",
+                sql,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            sql = re.sub(
+                r"<set[^>]*>(.*?)</set>",
+                r"SET \1",
+                sql,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            sql = re.sub(
+                r"<trim[^>]*>(.*?)</trim>", r"\1", sql, flags=re.DOTALL | re.IGNORECASE
+            )
+
+            # 处理<foreach>标签 - 简化为示例值
+            foreach_pattern = r'<foreach[^>]*collection="([^"]*)"[^>]*item="([^"]*)"[^>]*>(.*?)</foreach>'
+
+            def replace_foreach(match):
+                collection = match.group(1)
+                item = match.group(2)
+                content = match.group(3)
+                # 简单替换为示例值
+                example_content = content.replace(f"#{{{item}}}", "'example_value'")
+                return f"({example_content})"
+
+            sql = re.sub(
+                foreach_pattern, replace_foreach, sql, flags=re.DOTALL | re.IGNORECASE
+            )
+
+            # 转换MyBatis占位符
+            # #{param} -> 'param_value' (预编译参数，用引号包围)
+            sql = re.sub(r"#\{([^}]+)\}", r"'{\1}'", sql)
+
+            # ${param} -> param_value (直接替换，不加引号)
+            sql = re.sub(r"\$\{([^}]+)\}", r"{\1}", sql)
+
+            # 清理多余的空白和逗号
+            sql = re.sub(r",\s*,", ",", sql)  # 移除重复逗号
+            sql = re.sub(r",\s*\)", ")", sql)  # 移除末尾逗号
+            sql = re.sub(r"\(\s*,", "(", sql)  # 移除开头逗号
+            sql = re.sub(r"\s+", " ", sql)  # 规范化空白
+
+            # 清理可能的语法问题
+            sql = re.sub(r"\bAND\s+AND\b", "AND", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"\bOR\s+OR\b", "OR", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"\bWHERE\s+AND\b", "WHERE", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"\bWHERE\s+OR\b", "WHERE", sql, flags=re.IGNORECASE)
+
+            return sql.strip()
+
+        except Exception as e:
+            logger.warning(f"MyBatis SQL标准化失败: {e}")
+            return sql
+
+    def _detect_mybatis_syntax(self, sql: str) -> bool:
+        """检测SQL是否包含MyBatis语法。
+
+        Args:
+            sql: SQL语句
+
+        Returns:
+            bool: 是否包含MyBatis语法
+        """
+        mybatis_patterns = [
+            r"#\{[^}]+\}",  # #{param}
+            r"\$\{[^}]+\}",  # ${param}
+            r"<if[^>]*>",  # <if test="...">
+            r"<where[^>]*>",  # <where>
+            r"<set[^>]*>",  # <set>
+            r"<foreach[^>]*>",  # <foreach>
+            r"<trim[^>]*>",  # <trim>
+            r"</if>",  # </if>
+            r"</where>",  # </where>
+            r"</set>",  # </set>
+            r"</foreach>",  # </foreach>
+            r"</trim>",  # </trim>
+        ]
+
+        for pattern in mybatis_patterns:
+            if re.search(pattern, sql, re.IGNORECASE):
+                return True
+
+        return False
